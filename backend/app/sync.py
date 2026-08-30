@@ -10,11 +10,11 @@ from .config import Settings
 from .events import EventHub
 from .models import CaptionSyncRequest, DatasetSyncRequest, OutputSyncRequest
 from .paths import (
+    clear_dataset_directory,
     dataset_counts,
+    dataset_directory_for_name,
     dataset_name_from_gdrive,
-    gdrive_uri,
     normalize_local_path,
-    safe_slug,
     validate_gdrive_path,
     validate_local_dataset,
 )
@@ -108,10 +108,12 @@ class SyncService:
 
     async def start_dataset(self, request: DatasetSyncRequest) -> Tuple[dict, ProcessRun]:
         remote_path = validate_gdrive_path(request.gdrive_path, self.settings.gdrive_remote)
-        dataset_name = safe_slug(request.dataset_name or dataset_name_from_gdrive(remote_path, self.settings), "dataset")
-        local_path = self.settings.data_root / dataset_name
-        local_path.mkdir(parents=True, exist_ok=True)
+        dataset_name = request.dataset_name or dataset_name_from_gdrive(remote_path, self.settings)
+        local_path = dataset_directory_for_name(dataset_name, self.settings)
         state = await self._new_state("dataset", local_path, remote_path)
+        # rclone remains copy-only.  Clear only the validated dataset child
+        # after the remote check, so deleted Drive files cannot linger locally.
+        state["cleared_entry_count"] = clear_dataset_directory(local_path, self.settings)
         command = self.rclone.dataset_command(remote_path, local_path)
         return await self._start("dataset", command, state, state["sync_id"])
 

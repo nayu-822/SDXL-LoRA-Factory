@@ -4,7 +4,6 @@ python-multipart
 toml
 websockets
 huggingface_hub
-onnxruntime
 Pillow
 numpy
 pandas

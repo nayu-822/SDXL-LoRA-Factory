@@ -50,9 +50,10 @@ function loadSavedFields() {
     const ids = [
         'gdrive-dataset-path', 'dataset-path', 'model-path', 'vae-path', 'output-dir', 'output-name',
         'training-type',
+        'training-trigger-word',
         'epochs', 'repeats', 'batch-size', 'resolution-width', 'resolution-height', 'lora-rank',
         'lora-alpha', 'optimizer-type', 'learning-rate-input', 'unet-lr', 'text-encoder-lr',
-        'vram-mode', 'mixed-precision', 'workers', 'keep-tokens', 'min-snr-gamma-value',
+        'vram-mode', 'mixed-precision', 'workers', 'gradient-accumulation', 'keep-tokens', 'min-snr-gamma-value',
         'optimizer-args', 'seed', 'sample-prompts', 'sample-negative', 'sample-seed', 'sample-steps',
         'sample-width', 'sample-height', 'sample-sampler', 'sample-every', 'gdrive-output-path',
     ];
@@ -354,6 +355,8 @@ async function batchAddTriggerWords() {
 async function runAutoTagging() {
     const path = appState.datasetPath || getValue('dataset-path').trim();
     if (!path) return alert('先にDatasetを開いてください。');
+    const overwrite = document.querySelector('input[name="caption-policy"]:checked')?.value === 'overwrite';
+    if (overwrite && !window.confirm('既存captionを上書きします。手動編集したタグが失われる可能性があります。続行しますか？')) return;
     const button = byId('run-tagger-btn');
     if (button) { button.disabled = true; button.textContent = 'タグ付け中...'; }
     const progress = byId('tagger-progress-container');
@@ -363,8 +366,9 @@ async function runAutoTagging() {
             path,
             auto_sync_captions: isChecked('tagger-auto-sync'),
             gdrive_path: appState.gdriveDatasetPath || getValue('gdrive-dataset-path').trim(),
+            overwrite_existing_captions: overwrite,
         }));
-        setStatus('caption-sync-status', `WD14開始: ${data.image_count} images`, 'running');
+        setStatus('caption-sync-status', `WD14開始: ${data.image_count} images / ${overwrite ? 'overwrite' : 'skip existing'}`, 'running');
         connectWebSocket();
         watchStatus();
     } catch (error) {
@@ -418,11 +422,13 @@ function trainingPayload() {
         gradient_checkpointing: isChecked('gradient-checkpointing'),
         mixed_precision: getValue('mixed-precision', 'bf16'),
         workers: getNumber('workers', 2),
+        gradient_accumulation_steps: getNumber('gradient-accumulation', 1),
         seed: getOptionalNumber('seed'),
         unet_lr: getOptionalNumber('unet-lr'),
         text_encoder_lr: getOptionalNumber('text-encoder-lr'),
         flip_aug: isChecked('flip-aug'),
         shuffle_caption: isChecked('shuffle-caption'),
+        trigger_word: getValue('training-trigger-word').trim(),
         keep_tokens: getNumber('keep-tokens', 1),
         min_snr_gamma: isChecked('min-snr-gamma'),
         min_snr_gamma_value: getNumber('min-snr-gamma-value', 5),
@@ -521,6 +527,15 @@ function handleStatus(channel, status) {
         updateTrainingProgress(status.progress);
         if (status.status) setStatus('job-info', `${status.status}${status.job_id ? ` · ${status.job_id}` : ''}`, status.status === 'failed' ? 'error' : status.status === 'completed' ? 'success' : 'running');
         showOutputFiles(status.output_files || []);
+        const outputSync = status.output_sync || {};
+        if (outputSync.enabled) {
+            const syncLabel = outputSync.status === 'completed'
+                ? 'Output同期完了'
+                : outputSync.status === 'failed'
+                    ? `Output同期失敗: ${outputSync.error || 'unknown error'}`
+                    : 'Output同期中...';
+            setStatus('output-sync-status', syncLabel, outputSync.status === 'failed' ? 'error' : outputSync.status === 'completed' ? 'success' : 'running');
+        }
         if (['completed', 'failed', 'cancelled'].includes(status.status)) {
             const button = byId('start-train-btn');
             if (button) { button.disabled = false; button.textContent = '🚀 LoRA学習開始 / Start Training'; }
@@ -530,15 +545,20 @@ function handleStatus(channel, status) {
     } else if (channel === 'tagger') {
         const progress = status.progress || {};
         updateTaggerProgress(progress.current || 0, progress.total || status.image_count || 0);
+        const countLabel = `tagged ${status.tagged_count || 0} / skipped ${status.skipped_count || 0} / failed ${status.failed_count || 0}`;
         if (status.status === 'completed') {
             byId('run-tagger-btn').disabled = false;
             byId('run-tagger-btn').textContent = '自動タグ付け / Run WD14';
-            setStatus('caption-sync-status', `WD14完了: ${status.caption_count || 0} captions`, 'success');
+            setStatus('caption-sync-status', `WD14完了: ${countLabel} (${status.caption_count || 0} captions)`, 'success');
             setTimeout(() => refreshDataset(), 250);
         } else if (status.status === 'failed') {
             byId('run-tagger-btn').disabled = false;
             byId('run-tagger-btn').textContent = '自動タグ付け / Run WD14';
-            setStatus('caption-sync-status', status.error || 'WD14 failed', 'error');
+            setStatus('caption-sync-status', `${status.error || 'WD14 failed'} · ${countLabel}`, 'error');
+        } else if (status.status === 'cancelled') {
+            byId('run-tagger-btn').disabled = false;
+            byId('run-tagger-btn').textContent = '自動タグ付け / Run WD14';
+            setStatus('caption-sync-status', `WD14停止 · ${countLabel}`, 'error');
         }
     } else if (channel === 'sync') {
         const operation = status.operation;
@@ -623,10 +643,15 @@ async function calculateRecommendation() {
     let imageCount = getNumber('image-count', 0);
     try {
         if (path) imageCount = (await api(`/api/validate-dataset?path=${encodeURIComponent(path)}`)).image_count;
-        const data = await api('/api/recommendations', jsonOptions({ image_count: imageCount, training_type: getValue('training-type', 'character'), vram: getValue('vram-mode') }));
+        const data = await api('/api/recommendations', jsonOptions({
+            image_count: imageCount,
+            training_type: getValue('training-type', 'character'),
+            vram: getValue('vram-mode'),
+            gradient_accumulation_steps: getNumber('gradient-accumulation', 1),
+        }));
         appState.recommendation = data;
         const result = byId('recommendation-result');
-        if (result) result.textContent = `Epochs ${data.epochs} / Repeats ${data.repeats} / Dim ${data.network_dim} / Alpha ${data.network_alpha} / ${data.optimizer} / LR ${data.learning_rate} / Min SNR ${data.min_snr_gamma}`;
+        if (result) result.textContent = `Epochs ${data.epochs} / Repeats ${data.repeats} / Dim ${data.network_dim} / Alpha ${data.network_alpha} / ${data.optimizer} / LR ${data.learning_rate} / Min SNR ${data.min_snr_gamma} / ${data.estimated_total_steps_label || 'estimated'} steps ${data.estimated_total_steps ?? '—'}`;
         byId('apply-recommendation-btn').hidden = false;
     } catch (error) { showError(error); }
 }
@@ -634,7 +659,7 @@ async function calculateRecommendation() {
 function applyRecommendation() {
     const data = appState.recommendation;
     if (!data) return;
-    const mappings = { epochs: data.epochs, repeats: data.repeats, 'batch-size': data.batch_size, 'lora-rank': data.network_dim, 'lora-alpha': data.network_alpha, 'optimizer-type': data.optimizer, 'learning-rate-input': data.learning_rate, 'min-snr-gamma-value': data.min_snr_gamma };
+    const mappings = { epochs: data.epochs, repeats: data.repeats, 'batch-size': data.batch_size, 'lora-rank': data.network_dim, 'lora-alpha': data.network_alpha, 'optimizer-type': data.optimizer, 'learning-rate-input': data.learning_rate, 'min-snr-gamma-value': data.min_snr_gamma, 'gradient-accumulation': data.gradient_accumulation_steps || 1 };
     Object.entries(mappings).forEach(([id, value]) => { if (byId(id)) { byId(id).value = value; saveField(id); } });
     if (byId('min-snr-gamma')) { byId('min-snr-gamma').checked = true; saveField('min-snr-gamma'); }
     alert('提案をフォームへ適用しました。内容を確認してから学習を開始してください。');

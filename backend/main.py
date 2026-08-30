@@ -76,7 +76,7 @@ sync_service = SyncService(settings, rclone, processes, hub)
 tagger_service = TaggerService(settings, processes, hub, sync_service)
 training_service = TrainingService(settings, processes, hub, sync_service)
 
-app = FastAPI(title="SDXL LoRA Factory", version="5.0-runpod")
+app = FastAPI(title="SDXL LoRA Factory", version="5.1-runpod")
 
 
 def _http_error(error: Exception) -> HTTPException:
@@ -347,7 +347,12 @@ async def job(job_id: str):
 
 @app.post("/api/recommendations")
 async def recommendations(request: RecommendationRequest):
-    return recommend_settings(request.image_count, request.training_type, request.vram)
+    return recommend_settings(
+        request.image_count,
+        request.training_type,
+        request.vram,
+        request.gradient_accumulation_steps,
+    )
 
 
 @app.post("/api/cancel/{kind}")

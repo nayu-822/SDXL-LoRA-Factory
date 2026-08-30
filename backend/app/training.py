@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import random
 import shlex
@@ -85,6 +86,21 @@ def build_sample_prompts(config: TrainingConfig) -> list[dict]:
         prompts.insert(0, config.sample_prompt.strip())
     if not prompts:
         prompts = ["a high quality portrait of a character"]
+    trigger_word = config.trigger_word.strip()
+    if trigger_word:
+        normalized_trigger = trigger_word.casefold()
+        normalized_prompts = []
+        for prompt in prompts:
+            tags = [tag.strip().casefold() for tag in prompt.split(",")]
+            if tags and tags[0] == normalized_trigger:
+                normalized_prompts.append(prompt)
+            elif normalized_trigger in tags:
+                # Avoid duplicating a trigger that is already present later in
+                # a manually authored prompt as well.
+                normalized_prompts.append(prompt)
+            else:
+                normalized_prompts.append(f"{trigger_word}, {prompt}")
+        prompts = normalized_prompts
     return [
         {
             "prompt": prompt,
@@ -317,28 +333,53 @@ class TrainingService:
             elapsed = asyncio.get_running_loop().time() - state["_started_monotonic"]
             state["duration"] = f"{elapsed:.1f}s"
             summary_path = Path(state["output_dir"]) / "training_summary.txt"
-            summary_data = self._summary_data(state, config, dataset_path, counts, parser)
-            # Include the summary itself in the manifest written into the summary.
-            if "training_summary.txt" not in summary_data["output_files"]:
-                summary_data["output_files"].append("training_summary.txt")
-            write_training_summary(summary_path, summary_data)
+            state["output_sync"] = {
+                "enabled": bool(config.auto_sync_output),
+                "gdrive_output_path": gdrive_output_path,
+                "status": "pending" if config.auto_sync_output else "not_requested",
+            }
             if "training_summary.txt" not in state["output_files"]:
                 state["output_files"].append("training_summary.txt")
             state["summary_path"] = str(summary_path)
+
+            def write_summary() -> None:
+                summary_data = self._summary_data(state, config, dataset_path, counts, parser)
+                # Include the summary itself in the manifest written into the summary.
+                if "training_summary.txt" not in summary_data["output_files"]:
+                    summary_data["output_files"].append("training_summary.txt")
+                write_training_summary(summary_path, summary_data)
+
+            # Write a provisional summary before an optional output transfer.
+            write_summary()
             self._persist(state)
             await self.hub.status("train", self._public_state(state), job_id)
 
-            if self.sync_service is not None and config.auto_sync_output:
+            if config.auto_sync_output:
                 try:
+                    if self.sync_service is None:
+                        raise RuntimeError("output sync service is unavailable")
                     sync_state, sync_run = await self.sync_service.start_output(
                         OutputSyncRequest(local_output_path=state["output_dir"], gdrive_path=gdrive_output_path)
                     )
                     await self.manager.wait(sync_run)
-                    state["output_sync"] = sync_state
+                    state["output_sync"] = {
+                        "enabled": True,
+                        "gdrive_output_path": gdrive_output_path,
+                        **sync_state,
+                    }
                     if sync_state.get("status") != "completed":
                         state["warnings"].append("automatic output sync failed")
                 except Exception as error:
+                    state["output_sync"] = {
+                        "enabled": True,
+                        "gdrive_output_path": gdrive_output_path,
+                        "status": "failed",
+                        "error": str(error),
+                    }
                     state["warnings"].append(f"automatic output sync failed: {error}")
+                # Replace the provisional summary so the final sync result is
+                # available to both the UI and downstream diagnostics.
+                write_summary()
                 self._persist(state)
                 await self.hub.status("train", self._public_state(state), job_id)
 
@@ -410,6 +451,52 @@ class TrainingService:
             "final_lora": str(final_lora) if final_lora.is_file() else "",
         }
 
+    @staticmethod
+    def _loss_diagnostics(state: dict, config: TrainingConfig, counts: dict, parser: LossParser) -> dict:
+        image_count = int(counts.get("image_count", 0) or 0)
+        images_x_repeats = image_count * config.repeats if image_count else None
+        effective_images_per_epoch = images_x_repeats
+        steps_per_epoch_estimated = (
+            math.ceil(images_x_repeats / (config.batch_size * config.gradient_accumulation_steps))
+            if images_x_repeats is not None
+            else None
+        )
+
+        total_training_steps = parser.total_steps if parser.total_steps and parser.total_steps > 0 else None
+        total_training_steps_source = "observed" if total_training_steps is not None else ""
+        if total_training_steps is None and state.get("status") == "completed" and parser.step:
+            total_training_steps = parser.step
+            total_training_steps_source = "observed"
+
+        epoch_losses = []
+        for epoch, record in parser.epochs.items():
+            value = record.get("average_loss")
+            if value is None:
+                continue
+            try:
+                epoch_losses.append((int(epoch), float(value)))
+            except (TypeError, ValueError):
+                continue
+        lowest_epoch_loss = min((value for _, value in epoch_losses), default=None)
+        lowest_loss_epoch = next(
+            (epoch for epoch, value in sorted(epoch_losses) if value == lowest_epoch_loss),
+            None,
+        )
+        final_loss = parser.loss if parser.loss is not None else parser.average_loss
+        return {
+            "total_training_steps": total_training_steps,
+            "total_training_steps_source": total_training_steps_source,
+            "effective_images_per_epoch": effective_images_per_epoch,
+            "images_x_repeats": images_x_repeats,
+            "steps_per_epoch_estimated": steps_per_epoch_estimated,
+            "estimated_total_steps": (
+                steps_per_epoch_estimated * config.epochs if steps_per_epoch_estimated is not None else None
+            ),
+            "lowest_epoch_loss": lowest_epoch_loss,
+            "lowest_loss_epoch": lowest_loss_epoch,
+            "final_loss": final_loss,
+        }
+
     def _summary_data(self, state: dict, config: TrainingConfig, dataset_path: Path, counts: dict, parser: LossParser) -> dict:
         actual_config = _model_dict(config)
         hardware = gpu_info()
@@ -417,6 +504,7 @@ class TrainingService:
             "base_model": config.model,
             "vae": config.vae,
             "training_type": config.training_type,
+            "trigger_word": config.trigger_word,
             "resolution": f"{config.resolution_width}x{config.resolution_height}",
             "batch_size": config.batch_size,
             "epochs": config.epochs,
@@ -436,6 +524,7 @@ class TrainingService:
             "save_every_n_epochs": 1,
             "actual_config": json.dumps(actual_config, ensure_ascii=False, sort_keys=True),
         }
+        loss_diagnostics = self._loss_diagnostics(state, config, counts, parser)
         return {
             "job_id": state["job_id"],
             "job_name": state["job_name"],
@@ -457,13 +546,14 @@ class TrainingService:
                 **counts,
             },
             "caption": {
-                "trigger_words": "managed in caption editor",
+                "trigger_words": config.trigger_word,
                 "shuffle_caption": config.shuffle_caption,
                 "keep_tokens": config.keep_tokens,
             },
             "training_config": training_config,
             "command": shlex.join(state["command"]),
-            "loss_history": {**parser.as_dict(), "final_loss": parser.loss},
+            "loss_history": parser.as_dict(),
+            "loss_diagnostics": loss_diagnostics,
             "sample_settings": {
                 "sample_prompt": " | ".join(item["prompt"] for item in build_sample_prompts(config)),
                 "negative_prompt": config.sample_negative_prompt,
@@ -476,6 +566,8 @@ class TrainingService:
                 "sample_at_first": config.sample_at_first,
             },
             "output_files": list(state.get("output_files", [])),
+            "output_sync": dict(state.get("output_sync", {})),
+            "step_loss_summary_limit": 800,
             "warnings": list(dict.fromkeys(state.get("warnings", []))),
             "errors": list(dict.fromkeys(state.get("errors", []))),
         }

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.metadata
 import shutil
 import subprocess
 import sys
@@ -136,6 +137,35 @@ def check_requirements() -> bool:
     return ok
 
 
+def check_onnxruntime() -> bool:
+    """Install the provider-appropriate ONNX Runtime distribution.
+
+    The import name is ``onnxruntime`` for both distributions, so the choice
+    belongs here rather than in the shared requirements file.  Windows keeps
+    the CPU package for compatibility; Linux/NVIDIA Pods use the GPU wheel.
+    """
+
+    use_gpu = sys.platform.startswith("linux") and nvidia_gpu_name() is not None
+    package = "onnxruntime-gpu" if use_gpu else "onnxruntime"
+    opposite = "onnxruntime" if use_gpu else "onnxruntime-gpu"
+    print(f"[SETUP] Selecting {package} for WD14 (Linux/NVIDIA GPU: {use_gpu}).")
+    # Avoid leaving both distributions installed: both expose the same Python
+    # import package and the last wheel installed would otherwise win silently.
+    try:
+        importlib.metadata.version(opposite)
+    except importlib.metadata.PackageNotFoundError:
+        pass
+    else:
+        if not run_command([sys.executable, "-m", "pip", "uninstall", "-y", opposite]):
+            print(f"[WARN] Could not remove the alternate ONNX Runtime package: {opposite}")
+    if run_command([sys.executable, "-m", "pip", "install", "--upgrade", package]):
+        return True
+    if use_gpu:
+        print("[WARN] onnxruntime-gpu installation failed; falling back to CPU onnxruntime.")
+        return run_command([sys.executable, "-m", "pip", "install", "--upgrade", "onnxruntime"])
+    return False
+
+
 def main() -> int:
     print("=" * 60)
     print("  SDXL LoRA Factory - Environment Setup Check")
@@ -145,6 +175,8 @@ def main() -> int:
     if not check_pytorch():
         return 1
     if not check_requirements():
+        return 1
+    if not check_onnxruntime():
         return 1
     print("[SETUP] Setup check completed successfully.")
     return 0

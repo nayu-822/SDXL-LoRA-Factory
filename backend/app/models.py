@@ -41,12 +41,14 @@ class TaggerConfig(BaseModel):
     model: str = ""
     auto_sync_captions: bool = False
     gdrive_path: str = ""
+    overwrite_existing_captions: bool = False
 
 
 class RecommendationRequest(BaseModel):
     image_count: int = Field(..., ge=0)
     training_type: str = "character"
     vram: str = "balanced"
+    gradient_accumulation_steps: int = Field(1, ge=1, le=128)
 
 
 class TrainingConfig(BaseModel):
@@ -58,6 +60,7 @@ class TrainingConfig(BaseModel):
     name: str = "my_sdxl_lora"
     training_type: str = "character"
     vram: str = "balanced"
+    trigger_word: str = ""
     epochs: int = Field(10, ge=1, le=10000)
     lr: float = Field(1e-4, gt=0)
     rank: int = Field(16, ge=1, le=1024)

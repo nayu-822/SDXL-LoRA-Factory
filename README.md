@@ -71,6 +71,8 @@ People who do not have a GPU (or have an AMD/Intel GPU).</code>
 
 v5.0 adds a browser workflow for copying a dataset from Google Drive into the Pod, editing captions, training SDXL LoRA, and copying results back. The backend listens on `0.0.0.0` so it can be opened through the RunPod HTTP Proxy. Dataset and result transfers use `rclone copy`; the app never runs a destructive `rclone sync` for these workflows.
 
+When a dataset is re-synced, the app first clears only the local `LOCAL_DATA_ROOT/<dataset_name>` work folder, recreates that folder, and then runs `rclone copy`. This removes files deleted from Drive while keeping the Drive side untouched. The `LOCAL_DATA_ROOT` directory itself and paths outside it are rejected by the cleanup guard.
+
 ### RunPod quick start
 
 1. Start a Pod with an NVIDIA GPU and open a terminal.
@@ -78,11 +80,12 @@ v5.0 adds a browser workflow for copying a dataset from Google Drive into the Po
 3. Install/configure `rclone` and create a Google Drive remote named `gdrive` (or set `GDRIVE_REMOTE`). Keep `rclone.conf` outside Git, for example at `/workspace/rclone/rclone.conf`.
 4. Set the environment variables below. The defaults match a standard Pod layout.
 5. Install dependencies in the Pod image, or run `AUTO_SETUP=1 ./start.sh` for the optional setup check. A manual install is:
-   `python3 -m pip install -r backend/requirements.txt && python3 -m pip install -r backend/sd-scripts/requirements.txt`.
+   `python3 -m pip install -r backend/requirements.txt && python3 -m pip install -r backend/sd-scripts/requirements.txt && python3 backend/setup_check.py`.
+   The setup check selects `onnxruntime-gpu` on Linux with an NVIDIA GPU and `onnxruntime` on Windows/CPU environments.
 6. Run `./start.sh`, then open the Pod's HTTP Proxy URL for port `8001`.
 7. Enter a Drive dataset path such as `sdxl_lora/datasets/my_character` and click **DatasetをPodへ同期**.
-8. Open the Tag Editor, run WD14, edit captions, apply batch changes/Trigger Word, and click caption sync.
-9. Configure the base model, epochs, repeats, LoRA settings, and fixed epoch sample settings.
+8. Open the Tag Editor, run WD14, edit captions, apply batch changes/Trigger Word, and click caption sync. Existing `.txt` captions are skipped by default; choose the explicit overwrite option only when replacing manual edits is intended.
+9. Configure the base model, epochs, repeats, LoRA settings, Trigger Word, and fixed epoch sample settings. The Trigger Word is automatically added to every sample prompt for comparison, including the fallback prompt when no prompt is entered.
 10. Start training. Each epoch is saved with `--save_every_n_epochs=1`; samples use sd-scripts' `--sample_at_first` and `--sample_every_n_epochs=1` defaults.
 11. When training finishes, review the live log, Loss history, epoch LoRAs, samples, and `training_summary.txt`. Enable or manually run output sync to copy them to Drive.
 
@@ -104,7 +107,9 @@ The same values can be copied from `.env.example` into the Pod environment. The 
 
 ### RunPod troubleshooting
 
-The system status card reports missing `rclone`, a missing `rclone.conf`, a missing Drive remote, and GPU/PyTorch information. Dataset, model, WD14, sample, training, and output-sync errors are shown in the UI and retained in the job log/summary where possible. On Linux the desktop Browse dialogs are intentionally disabled; enter Pod paths manually. `WD14_ALLOW_MOCK=true` is available only for a local smoke test and should not be used for real captions.
+The system status card reports missing `rclone`, a missing `rclone.conf`, a missing Drive remote, and GPU/PyTorch information. Dataset, model, WD14, sample, training, and output-sync errors are shown in the UI and retained in the job log/summary where possible. WD14 logs the available ONNX Runtime providers and the provider selected for the session; it prefers CUDA on Linux/NVIDIA and falls back to CPU when CUDA is unavailable. On Linux the desktop Browse dialogs are intentionally disabled; enter Pod paths manually. `WD14_ALLOW_MOCK=true` is available only for a local smoke test and should not be used for real captions.
+
+The final `training_summary.txt` records the actual Trigger Word, loss diagnostics, and an `[OUTPUT SYNC]` section. Automatic output-sync failure is a warning and does not change a successfully completed training job to `failed`. On RunPod/Linux, dataset editing, WD14, caption sync, and dataset cleanup are limited to `LOCAL_DATA_ROOT`; the Windows desktop compatibility switch can continue to accept external dataset folders.
 
 The original Windows `start.bat` workflow and Windows-oriented usage notes below are retained.
 

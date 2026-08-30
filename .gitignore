@@ -35,3 +35,6 @@ hf_cache/
 huggingface/
 models/
 cache/
+.cache/
+**/tensorboard/
+*.tfevents.*

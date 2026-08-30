@@ -38,7 +38,16 @@ def torch_info() -> dict:
 
 
 def dependency_info() -> dict:
-    names = ["fastapi", "uvicorn", "torch", "diffusers", "transformers", "onnxruntime", "tensorboard"]
+    names = [
+        "fastapi",
+        "uvicorn",
+        "torch",
+        "diffusers",
+        "transformers",
+        "onnxruntime",
+        "onnxruntime-gpu",
+        "tensorboard",
+    ]
     result = {}
     for name in names:
         try:

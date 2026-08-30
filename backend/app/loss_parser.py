@@ -30,6 +30,7 @@ class LossParser:
         self.learning_rate: Optional[float] = None
         self.steps: List[dict] = []
         self.epochs: Dict[int, dict] = {}
+        self.structured_epoch_averages: List[dict] = []
 
     @staticmethod
     def _float(match: Optional[re.Match]) -> Optional[float]:
@@ -78,6 +79,99 @@ class LossParser:
             }
         return self.progress()
 
+    def merge_structured_records(self, records: List[dict]) -> None:
+        """Merge scalar records using the bundled sd-scripts step semantics.
+
+        ``train_network.py`` sends step logs with ``global_step`` as the
+        TensorBoard step, but sends ``loss/epoch_average`` through
+        ``epoch_logging`` where the TensorBoard step is the one-based epoch.
+        Keeping those streams separate prevents an epoch average from being
+        mistaken for a step-loss record.
+        """
+
+        scalar_cache: Dict[int, dict] = {}
+        epoch_by_step: Dict[int, int] = {}
+        epoch_records: List[dict] = []
+        for item in records:
+            try:
+                tag = str(item["tag"])
+                step = int(item["step"])
+                value = float(item["value"])
+            except (KeyError, TypeError, ValueError):
+                continue
+
+            if tag in {"epoch", "global/epoch", "training/epoch"}:
+                epoch_by_step[step] = int(round(value))
+                continue
+            if tag == "loss/epoch_average":
+                epoch_records.append({"step": step, "value": value})
+                continue
+
+            record = scalar_cache.setdefault(step, {"step": step})
+            if tag in {"loss/current", "loss/current_step"}:
+                record["loss"] = value
+            elif tag == "loss/average":
+                record["average_loss"] = value
+            elif tag.startswith("lr/") and "learning_rate" not in record:
+                record["learning_rate"] = value
+
+        for item in epoch_records:
+            step = item["step"]
+            epoch = epoch_by_step.get(step, step if step > 0 else None)
+            structured = {
+                "epoch": epoch,
+                "average_loss": item["value"],
+                "step": step,
+            }
+            existing_structured = next(
+                (
+                    record
+                    for record in self.structured_epoch_averages
+                    if record.get("epoch") == epoch and record.get("step") == step
+                ),
+                None,
+            )
+            if existing_structured is None:
+                self.structured_epoch_averages.append(structured)
+            else:
+                existing_structured.update(structured)
+            if epoch is None:
+                continue
+            existing = self.epochs.get(epoch)
+            if existing is None:
+                self.epochs[epoch] = structured
+            else:
+                # Console output is the preferred source when it supplied an
+                # epoch average.  TensorBoard fills only missing fields.
+                if existing.get("average_loss") is None:
+                    existing["average_loss"] = item["value"]
+                if existing.get("step") is None:
+                    existing["step"] = step
+
+        for step in sorted(scalar_cache):
+            record = scalar_cache[step]
+            existing = next((item for item in self.steps if item.get("step") == step), None)
+            if existing is None:
+                self.steps.append(record)
+            else:
+                # Do not erase the epoch inferred from stdout when a
+                # TensorBoard step record has no epoch field.
+                existing.update({key: value for key, value in record.items() if value is not None})
+
+        self.steps.sort(key=lambda item: item.get("step", 0))
+        self.epochs = dict(sorted(self.epochs.items()))
+        if epoch_records and self.average_loss is None:
+            self.average_loss = max(epoch_records, key=lambda item: item["step"])["value"]
+        if self.steps:
+            latest = self.steps[-1]
+            self.step = latest.get("step", self.step)
+            if latest.get("loss") is not None:
+                self.loss = latest["loss"]
+            if latest.get("average_loss") is not None:
+                self.average_loss = latest["average_loss"]
+            if latest.get("learning_rate") is not None:
+                self.learning_rate = latest["learning_rate"]
+
     def merge_tensorboard(self, logging_dir: Path) -> None:
         """Prefer structured TensorBoard values when the optional reader is installed."""
         try:
@@ -86,6 +180,7 @@ class LossParser:
             return
 
         event_files = list(logging_dir.rglob("events.out.tfevents.*")) if logging_dir.exists() else []
+        records: List[dict] = []
         for event_file in event_files:
             try:
                 accumulator = EventAccumulator(str(event_file))
@@ -93,44 +188,14 @@ class LossParser:
             except Exception:
                 continue
             tags = accumulator.Tags().get("scalars", [])
-            scalar_cache: Dict[int, dict] = {}
             for tag in tags:
                 try:
                     values = accumulator.Scalars(tag)
                 except Exception:
                     continue
                 for item in values:
-                    record = scalar_cache.setdefault(int(item.step), {"step": int(item.step)})
-                    if tag in {"loss/current", "loss/current_step"}:
-                        record["loss"] = float(item.value)
-                    elif tag in {"loss/average", "loss/epoch_average"}:
-                        record["average_loss"] = float(item.value)
-                        if tag == "loss/epoch_average":
-                            epoch = len(self.epochs) + 1
-                            record["epoch"] = epoch
-                            self.epochs[epoch] = {
-                                "epoch": epoch,
-                                "average_loss": float(item.value),
-                                "step": int(item.step),
-                            }
-                    elif tag.startswith("lr/") and "learning_rate" not in record:
-                        record["learning_rate"] = float(item.value)
-            for step in sorted(scalar_cache):
-                record = scalar_cache[step]
-                if any(existing.get("step") == step for existing in self.steps):
-                    for existing in self.steps:
-                        if existing.get("step") == step:
-                            existing.update(record)
-                            break
-                else:
-                    self.steps.append(record)
-        self.steps.sort(key=lambda item: item.get("step", 0))
-        if self.steps:
-            latest = self.steps[-1]
-            self.step = latest.get("step", self.step)
-            self.loss = latest.get("loss", self.loss)
-            self.average_loss = latest.get("average_loss", self.average_loss)
-            self.learning_rate = latest.get("learning_rate", self.learning_rate)
+                    records.append({"tag": tag, "step": int(item.step), "value": float(item.value)})
+        self.merge_structured_records(records)
 
     def progress(self) -> dict:
         return {
@@ -144,4 +209,9 @@ class LossParser:
         }
 
     def as_dict(self) -> dict:
-        return {**self.progress(), "steps": self.steps, "epochs": list(self.epochs.values())}
+        return {
+            **self.progress(),
+            "steps": self.steps,
+            "epochs": list(self.epochs.values()),
+            "final_loss": self.loss,
+        }

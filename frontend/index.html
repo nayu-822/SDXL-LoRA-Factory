@@ -6,7 +6,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>SDXL LoRA Factory</title>
     <link rel="icon" href="assets/favicon.ico">
-    <link rel="stylesheet" href="style.css?v=5.0">
+    <link rel="stylesheet" href="style.css?v=5.1">
 </head>
 
 <body>
@@ -14,7 +14,7 @@
         <div>
             <h1>SDXL LoRA<br>Factory</h1>
             <p class="app-subtitle">RunPod / Windows</p>
-            <p class="app-version">v5.0</p>
+            <p class="app-version">v5.1</p>
         </div>
         <nav>
             <div class="nav-item active" data-tab="dataset">
@@ -77,6 +77,7 @@
                         <input type="text" id="dataset-path" placeholder="/workspace/data/my_character または Windowsのパス">
                         <button class="btn btn-secondary" onclick="browseFolder()">参照 / Browse</button>
                     </div>
+                    <p class="field-help">RunPod/LinuxではDataset編集対象は <code>LOCAL_DATA_ROOT</code> 配下に限定されます。Windowsでは既存の外部Dataset互換設定を利用できます。</p>
                 </div>
                 <div class="button-row">
                     <button class="btn btn-primary" onclick="validatePath()">タグ編集へ / Open Tag Editor</button>
@@ -99,6 +100,12 @@
                     <button class="btn btn-secondary" onclick="refreshDataset()">🔄 再読み込み / Refresh</button>
                     <button class="btn btn-primary" id="run-tagger-btn" onclick="runAutoTagging()">自動タグ付け / Run WD14</button>
                 </div>
+                <fieldset class="caption-policy">
+                    <legend>既存captionの扱い / Existing captions</legend>
+                    <label class="radio-line"><input type="radio" name="caption-policy" value="skip" checked><span>既存captionはスキップ / Skip existing captions</span></label>
+                    <label class="radio-line"><input type="radio" name="caption-policy" value="overwrite"><span>既存captionを上書き / Overwrite existing captions</span></label>
+                    <p class="field-help">上書きすると手動編集したタグが失われる可能性があります。デフォルトはスキップです。</p>
+                </fieldset>
             </div>
             <div class="card">
                 <h3>一括編集 / Batch Edit</h3>
@@ -188,6 +195,10 @@
                     <div><label for="mixed-precision">Mixed Precision</label><select id="mixed-precision"><option value="bf16" selected>bf16</option><option value="fp16">fp16</option><option value="no">no</option></select></div>
                     <div><label for="workers">DataLoader workers</label><input type="number" id="workers" value="2" min="0"></div>
                 </div>
+                <div class="form-group">
+                    <label for="gradient-accumulation">Gradient accumulation steps</label>
+                    <input type="number" id="gradient-accumulation" value="1" min="1">
+                </div>
                 <div class="checkbox-grid">
                     <label class="checkbox-line"><input type="checkbox" id="gradient-checkpointing" checked><span>Gradient checkpointing</span></label>
                     <label class="checkbox-line"><input type="checkbox" id="flip-aug"><span>Horizontal flip augmentation</span></label>
@@ -205,6 +216,7 @@
 
             <div class="card">
                 <h3>Epoch Samples / 学習途中サンプル</h3>
+                <div class="form-group"><label for="training-trigger-word">Trigger Word</label><input type="text" id="training-trigger-word" placeholder="my_character_v1"><p class="field-help">Character LoRAでは <strong>Trigger WordまたはSample Promptの入力を推奨</strong>。入力したTrigger Wordは全Sample Promptの先頭へ適用されます。</p></div>
                 <div class="form-group"><label for="sample-prompts">Sample Prompt（複数行で複数Prompt）</label><textarea id="sample-prompts" rows="3" placeholder="a portrait of the character, high quality"></textarea></div>
                 <div class="form-group"><label for="sample-negative">Negative Prompt</label><textarea id="sample-negative" rows="2" placeholder="low quality, blurry, bad anatomy"></textarea></div>
                 <div class="form-grid four-columns">
@@ -261,7 +273,7 @@
         </section>
     </main>
 
-    <script src="app.js?v=5.0"></script>
+    <script src="app.js?v=5.1"></script>
 </body>
 
 </html>

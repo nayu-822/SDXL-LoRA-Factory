@@ -316,6 +316,10 @@ code {
 .checkbox-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.6rem 1rem; margin: 0.8rem 0 1rem; }
 .checkbox-line { display: flex; align-items: center; gap: 0.5rem; color: var(--text-secondary); font-size: 0.8rem; cursor: pointer; margin: 0; }
 .checkbox-line input { width: auto; accent-color: var(--accent-orange); }
+.caption-policy { border: 1px solid var(--glass-border); border-radius: 0.7rem; padding: 0.8rem 1rem; margin-top: 0.9rem; }
+.caption-policy legend { color: var(--text-primary); font-size: 0.82rem; padding: 0 0.35rem; }
+.radio-line { display: flex; align-items: center; gap: 0.5rem; color: var(--text-secondary); font-size: 0.8rem; cursor: pointer; margin: 0.45rem 0; }
+.radio-line input { width: auto; accent-color: var(--accent-orange); }
 
 .progress-heading { display: flex; justify-content: space-between; gap: 1rem; margin-bottom: 0.5rem; font-size: 0.82rem; }
 .progress-track { background: rgba(255,255,255,0.1); height: 0.8rem; border-radius: 1rem; overflow: hidden; }

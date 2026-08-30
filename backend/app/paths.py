@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 import re
+import shutil
 from pathlib import Path, PurePosixPath
 from typing import Iterable, List
 
@@ -36,12 +38,25 @@ def is_within(path: Path, roots: Iterable[Path]) -> bool:
     return False
 
 
+def _allows_external_dataset_paths(settings: Settings) -> bool:
+    """Keep the legacy external-folder behavior on Windows only.
+
+    A RunPod process should never turn an arbitrary WORKSPACE_ROOT child into
+    a dataset-editing target.  Windows keeps the opt-in compatibility switch
+    because the original desktop application accepted folders anywhere on the
+    local machine.
+    """
+
+    return os.name == "nt" and settings.allow_external_dataset_paths
+
+
 def validate_local_dataset(value: str, settings: Settings) -> Path:
     path = normalize_local_path(value, settings)
-    if not settings.allow_external_dataset_paths and not is_within(
-        path, (settings.data_root, settings.workspace_root)
+    data_root = settings.data_root.resolve()
+    if not _allows_external_dataset_paths(settings) and (
+        path == data_root or not is_within(path, (data_root,))
     ):
-        raise ValueError("dataset path must be inside WORKSPACE_ROOT")
+        raise ValueError("dataset path must be a child of LOCAL_DATA_ROOT")
     if not path.exists():
         raise ValueError(f"dataset path does not exist: {path}")
     if not path.is_dir():
@@ -55,9 +70,8 @@ def image_files(dataset_path: Path) -> List[Path]:
 
 def validate_image_path(value: str, settings: Settings) -> Path:
     path = normalize_local_path(value, settings)
-    allowed_roots = (settings.data_root, settings.output_root, settings.job_root, settings.workspace_root)
-    if not settings.allow_external_dataset_paths and not is_within(path, allowed_roots):
-        raise ValueError("file path is outside the configured workspace")
+    if not _allows_external_dataset_paths(settings) and not is_within(path, (settings.data_root,)):
+        raise ValueError("image path must be inside LOCAL_DATA_ROOT")
     if not path.exists() or not is_image(path):
         raise ValueError(f"image does not exist: {path}")
     return path
@@ -128,6 +142,53 @@ def dataset_name_from_gdrive(value: str, settings: Settings) -> str:
 def safe_slug(value: str, fallback: str = "item") -> str:
     cleaned = _SLUG_RE.sub("-", (value or "").strip()).strip(".-_")
     return cleaned[:96] or fallback
+
+
+def _validated_dataset_cleanup_target(value: Path, settings: Settings) -> Path:
+    """Resolve and validate a direct child of LOCAL_DATA_ROOT before deletion."""
+
+    data_root = settings.data_root.expanduser().resolve()
+    candidate = Path(value).expanduser()
+    if not candidate.is_absolute():
+        candidate = data_root / candidate
+    if candidate.is_symlink():
+        raise ValueError("dataset cleanup target cannot be a symlink")
+    target = candidate.resolve()
+    if target == data_root or target.parent != data_root:
+        raise ValueError("dataset cleanup target must be a direct child of LOCAL_DATA_ROOT")
+    if target.exists() and not target.is_dir():
+        raise ValueError("dataset cleanup target is not a directory")
+    return target
+
+
+def dataset_directory_for_name(dataset_name: str, settings: Settings) -> Path:
+    """Return the only directory that a Drive dataset sync may clear."""
+
+    return _validated_dataset_cleanup_target(
+        settings.data_root.expanduser().resolve() / safe_slug(dataset_name, "dataset"), settings
+    )
+
+
+def clear_dataset_directory(dataset_path: Path, settings: Settings) -> int:
+    """Clear one dataset directory while preserving LOCAL_DATA_ROOT itself.
+
+    The target is validated immediately before any filesystem mutation.  Child
+    symlinks are unlinked as links, never traversed, and all other children are
+    removed only from the validated target.
+    """
+
+    target = _validated_dataset_cleanup_target(Path(dataset_path), settings)
+    settings.data_root.mkdir(parents=True, exist_ok=True)
+    removed_count = 0
+    if target.exists():
+        for child in target.iterdir():
+            if child.is_symlink() or not child.is_dir():
+                child.unlink()
+            else:
+                shutil.rmtree(child)
+            removed_count += 1
+    target.mkdir(parents=True, exist_ok=True)
+    return removed_count
 
 
 def caption_path_for_image(image_path: Path) -> Path:

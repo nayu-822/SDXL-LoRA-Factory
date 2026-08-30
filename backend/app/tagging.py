@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,6 +16,9 @@ from .sync import SyncService
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+_COUNT_RE = re.compile(r"\b(tagged_count|skipped_count|failed_count)=(\d+)")
 
 
 class TaggerService:
@@ -38,6 +42,8 @@ class TaggerService:
         command = [self._python(), str(script), f"--train_data_dir={dataset_path}"]
         if self.settings.allow_mock_tagger:
             command.append("--allow_mock")
+        if config.overwrite_existing_captions:
+            command.append("--overwrite_existing_captions")
         state = {
             "tagger_id": tagger_id,
             "status": "queued",
@@ -49,6 +55,10 @@ class TaggerService:
             "error": "",
             "auto_sync_captions": config.auto_sync_captions,
             "gdrive_path": config.gdrive_path,
+            "overwrite_existing_captions": config.overwrite_existing_captions,
+            "tagged_count": 0,
+            "skipped_count": 0,
+            "failed_count": 0,
             "progress": {"current": 0, "total": len(images), "percent": 0},
             "warnings": [],
         }
@@ -68,6 +78,9 @@ class TaggerService:
                     await self.hub.progress("tagger", state["progress"], tagger_id)
                 except (ValueError, IndexError):
                     pass
+            if "[TAGGER_COUNTS]" in line:
+                for key, value in _COUNT_RE.findall(line):
+                    state[key] = int(value)
             if "warning" in line.lower():
                 state["warnings"].append(line)
             await self.hub.log("tagger", line, tagger_id)
