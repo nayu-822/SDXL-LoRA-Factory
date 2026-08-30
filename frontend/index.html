@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="ja">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SDXL LoRA Factory</title>
+    <link rel="icon" href="assets/favicon.ico">
+    <link rel="stylesheet" href="style.css?v=5.0">
+</head>
+
+<body>
+    <aside class="sidebar">
+        <div>
+            <h1>SDXL LoRA<br>Factory</h1>
+            <p class="app-subtitle">RunPod / Windows</p>
+            <p class="app-version">v5.0</p>
+        </div>
+        <nav>
+            <div class="nav-item active" data-tab="dataset">
+                <span class="step-chip">Step 1</span>
+                <div class="nav-label"><span>📁</span><span>データセット準備<br><small>Dataset Prep</small></span></div>
+            </div>
+            <div class="nav-item" data-tab="tagger">
+                <span class="step-chip">Step 2</span>
+                <div class="nav-label"><span>🏷️</span><span>タグ編集<br><small>Tag Editor</small></span></div>
+            </div>
+            <div class="nav-item" data-tab="config">
+                <span class="step-chip">Step 3</span>
+                <div class="nav-label"><span>⚙️</span><span>学習設定<br><small>Configuration</small></span></div>
+            </div>
+            <div class="nav-item" data-tab="train">
+                <span class="step-chip">Step 4</span>
+                <div class="nav-label"><span>🚀</span><span>トレーニング実行<br><small>Execution</small></span></div>
+            </div>
+        </nav>
+        <div class="sidebar-footer">
+            <span class="status-dot" id="system-status-dot"></span>
+            <span id="system-status-text">接続確認中...</span>
+        </div>
+    </aside>
+
+    <main class="main-content">
+        <div class="top-status-bar">
+            <span id="system-summary">RunPod設定を確認中...</span>
+            <span id="active-dataset-summary">Dataset: 未選択</span>
+        </div>
+
+        <!-- Dataset -->
+        <section id="tab-dataset" class="tab-content">
+            <h2>データセット準備 / Dataset Prep</h2>
+            <div class="card">
+                <h3>💡 画像素材のヒント / Material Tips</h3>
+                <div class="hint-box"><strong>キャラクターLoRA:</strong> 衣装や背景が異なる高品質な画像を15〜30枚程度用意しましょう。<span class="lang-en">Prepare 15–30 varied, high-quality images.</span></div>
+                <div class="hint-box"><strong>解像度:</strong> SDXLは1024×1024前後を推奨します。アスペクト比はbucketで自動調整されます。<span class="lang-en">1024×1024 is recommended; aspect ratios are handled by buckets.</span></div>
+            </div>
+
+            <div class="card">
+                <h3>Google Drive → Pod / Dataset sync</h3>
+                <div class="form-group">
+                    <label for="gdrive-dataset-path">Google Drive Dataset Path</label>
+                    <input type="text" id="gdrive-dataset-path" placeholder="sdxl_lora/datasets/my_character" autocomplete="off">
+                    <p class="field-help">rclone remote名は自動で付与されます（例: gdrive:sdxl_lora/datasets/my_character）。Dataset側を削除しないため <code>rclone copy</code> を使用します。</p>
+                </div>
+                <div class="button-row">
+                    <button class="btn btn-primary" id="sync-dataset-btn" onclick="syncDataset()">☁️ DatasetをPodへ同期</button>
+                    <button class="btn btn-secondary" onclick="checkSystemStatus()">状態を再確認 / Check</button>
+                </div>
+                <div id="dataset-sync-status" class="status-box">未同期 / Not synced</div>
+            </div>
+
+            <div class="card">
+                <h3>ローカルDataset / Local Dataset</h3>
+                <div class="form-group">
+                    <label for="dataset-path">Pod内またはローカルの画像フォルダ</label>
+                    <div class="input-with-button">
+                        <input type="text" id="dataset-path" placeholder="/workspace/data/my_character または Windowsのパス">
+                        <button class="btn btn-secondary" onclick="browseFolder()">参照 / Browse</button>
+                    </div>
+                </div>
+                <div class="button-row">
+                    <button class="btn btn-primary" onclick="validatePath()">タグ編集へ / Open Tag Editor</button>
+                    <button class="btn btn-secondary" onclick="refreshDataset()">🔄 Dataset情報を更新</button>
+                </div>
+                <div id="dataset-stats" class="stats-grid compact-stats">
+                    <div><span>Images</span><strong id="image-count">—</strong></div>
+                    <div><span>Captions</span><strong id="caption-count">—</strong></div>
+                    <div><span>Missing captions</span><strong id="missing-caption-count">—</strong></div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Tagger -->
+        <section id="tab-tagger" class="tab-content" hidden>
+            <h2>ビジュアルタグエディタ / Visual Tag Editor</h2>
+            <div class="card toolbar-card">
+                <p class="muted">画像を見ながらcaptionを編集できます。タグは `.txt` に保存されます。</p>
+                <div class="button-row">
+                    <button class="btn btn-secondary" onclick="refreshDataset()">🔄 再読み込み / Refresh</button>
+                    <button class="btn btn-primary" id="run-tagger-btn" onclick="runAutoTagging()">自動タグ付け / Run WD14</button>
+                </div>
+            </div>
+            <div class="card">
+                <h3>一括編集 / Batch Edit</h3>
+                <div class="batch-row">
+                    <input type="text" id="batch-tags-input" list="tag-suggestions" placeholder="1girl, masterpiece, blue eyes">
+                    <datalist id="tag-suggestions"></datalist>
+                    <button class="btn btn-secondary" onclick="batchAddTags()">一括追加</button>
+                    <button class="btn btn-danger" onclick="batchRemoveTags()">一括削除</button>
+                </div>
+                <div class="batch-row trigger-row">
+                    <input type="text" id="trigger-word-input" placeholder="Trigger Word（caption先頭へ追加）">
+                    <button class="btn btn-success" onclick="batchAddTriggerWords()">Trigger Wordを全captionの先頭へ</button>
+                </div>
+                <div class="checkbox-line">
+                    <input type="checkbox" id="tagger-auto-sync">
+                    <label for="tagger-auto-sync">WD14完了後にcaptionをGoogle Driveへ自動同期 / Auto-sync captions after tagging</label>
+                </div>
+                <div class="button-row">
+                    <button class="btn btn-secondary" id="sync-captions-btn" onclick="syncCaptions()">☁️ captionをGoogle Driveへ同期</button>
+                    <span id="caption-sync-status" class="inline-status">未同期</span>
+                </div>
+            </div>
+            <div id="tagger-progress-container" class="card progress-card" hidden>
+                <div class="progress-heading"><span id="tagger-progress-text">タグ付け準備中...</span><strong id="tagger-progress-percent">0%</strong></div>
+                <div class="progress-track"><div id="tagger-progress-bar" class="progress-fill"></div></div>
+            </div>
+            <div class="tag-editor-grid" id="tag-editor-content">
+                <div class="card placeholder-card muted">Datasetを開くと、ここに画像とcaptionが表示されます。</div>
+            </div>
+        </section>
+
+        <!-- Configuration -->
+        <section id="tab-config" class="tab-content" hidden>
+            <h2>学習設定 / Configuration</h2>
+            <div class="card gpu-card">
+                <span class="gpu-icon">🖥️</span>
+                <div><div class="eyebrow">GPU / VRAM</div><strong id="gpu-info-display">情報を取得中...</strong></div>
+            </div>
+
+            <div class="card recommendation-card">
+                <div class="card-heading"><div><h3>設定の自動提案 / Rule-based suggestion</h3><p class="muted">画像数・学習タイプ・VRAMから提案します。自動適用はしません。</p></div><button class="btn btn-secondary" onclick="calculateRecommendation()">おすすめ設定を計算</button></div>
+                <div class="form-grid two-columns recommendation-inputs">
+                    <div><label for="training-type">学習タイプ / Training type</label><select id="training-type"><option value="character" selected>Character LoRA</option><option value="style">Style LoRA</option><option value="concept">Concept LoRA</option></select></div>
+                    <div class="recommendation-image-count"><span class="eyebrow">Dataset images</span><strong id="recommendation-image-count">Datasetを開くと自動取得</strong></div>
+                </div>
+                <div id="recommendation-result" class="recommendation-result muted">提案はまだありません。</div>
+                <button id="apply-recommendation-btn" class="btn btn-success" onclick="applyRecommendation()" hidden>提案を適用 / Apply suggestion</button>
+            </div>
+
+            <div class="card">
+                <h3>モデルと基本設定 / Model & Basics</h3>
+                <div class="form-group">
+                    <label for="model-path">SDXL Base Model（ローカルパスまたはHugging Face model id）</label>
+                    <div class="input-with-button"><input type="text" id="model-path" placeholder="/workspace/models/sdxl_base.safetensors または stabilityai/stable-diffusion-xl-base-1.0"><button class="btn btn-secondary" onclick="browseFile('model-path')">参照</button></div>
+                </div>
+                <div class="form-group">
+                    <label for="vae-path">VAE（任意）</label>
+                    <div class="input-with-button"><input type="text" id="vae-path" placeholder="/workspace/models/sdxl_vae.safetensors"><button class="btn btn-secondary" onclick="browseFile('vae-path')">参照</button></div>
+                </div>
+                <div class="form-group"><label for="output-dir">ローカル出力ルート（空欄ならLOCAL_OUTPUT_ROOT）</label><input type="text" id="output-dir" placeholder="/workspace/output"></div>
+                <div class="form-group"><label for="output-name">LoRA名称</label><input type="text" id="output-name" value="my_sdxl_lora"></div>
+                <div class="form-grid three-columns">
+                    <div><label for="epochs">Epochs</label><input type="number" id="epochs" value="10" min="1"></div>
+                    <div><label for="repeats">Repeats</label><input type="number" id="repeats" value="10" min="1"></div>
+                    <div><label for="batch-size">Batch Size</label><input type="number" id="batch-size" value="1" min="1"></div>
+                </div>
+                <div class="form-grid two-columns">
+                    <div><label for="resolution-width">Resolution width</label><input type="number" id="resolution-width" value="1024" min="64" step="64"></div>
+                    <div><label for="resolution-height">Resolution height</label><input type="number" id="resolution-height" value="1024" min="64" step="64"></div>
+                </div>
+            </div>
+
+            <div class="card">
+                <h3>LoRA / Optimizer</h3>
+                <div class="form-grid two-columns">
+                    <div><label for="lora-rank">Network Dim / Rank</label><input type="number" id="lora-rank" value="16" min="1"></div>
+                    <div><label for="lora-alpha">Network Alpha</label><input type="number" id="lora-alpha" value="16" min="1"></div>
+                </div>
+                <div class="form-group"><label for="optimizer-type">Optimizer</label><select id="optimizer-type"><option value="AdamW">AdamW</option><option value="Prodigy">Prodigy</option><option value="DAdaptAdam">DAdaptAdam</option></select></div>
+                <div class="form-grid three-columns">
+                    <div><label for="learning-rate-input">Learning Rate</label><input type="number" id="learning-rate-input" value="0.0001" step="0.00001"></div>
+                    <div><label for="unet-lr">UNet LR（任意）</label><input type="number" id="unet-lr" placeholder="未指定" step="0.00001"></div>
+                    <div><label for="text-encoder-lr">Text Encoder LR（任意）</label><input type="number" id="text-encoder-lr" placeholder="未指定" step="0.00001"></div>
+                </div>
+                <div class="form-group"><label for="vram-mode">VRAM optimization</label><select id="vram-mode"><option value="high">High (24GB+)</option><option value="balanced" selected>Balanced (12–16GB)</option><option value="low">Low (8–12GB)</option><option value="very_low">Very Low (&lt;8GB)</option></select></div>
+                <div class="form-grid two-columns">
+                    <div><label for="mixed-precision">Mixed Precision</label><select id="mixed-precision"><option value="bf16" selected>bf16</option><option value="fp16">fp16</option><option value="no">no</option></select></div>
+                    <div><label for="workers">DataLoader workers</label><input type="number" id="workers" value="2" min="0"></div>
+                </div>
+                <div class="checkbox-grid">
+                    <label class="checkbox-line"><input type="checkbox" id="gradient-checkpointing" checked><span>Gradient checkpointing</span></label>
+                    <label class="checkbox-line"><input type="checkbox" id="flip-aug"><span>Horizontal flip augmentation</span></label>
+                    <label class="checkbox-line"><input type="checkbox" id="shuffle-caption"><span>Shuffle caption</span></label>
+                    <label class="checkbox-line"><input type="checkbox" id="min-snr-gamma"><span>Min SNR Gamma</span></label>
+                    <label class="checkbox-line"><input type="checkbox" id="optimizer-low-vram"><span>Extra low-VRAM optimizer mode</span></label>
+                </div>
+                <div class="form-grid two-columns">
+                    <div><label for="keep-tokens">keep_tokens</label><input type="number" id="keep-tokens" value="1" min="0"></div>
+                    <div><label for="min-snr-gamma-value">Min SNR Gamma value</label><input type="number" id="min-snr-gamma-value" value="5" min="0" step="0.1"></div>
+                </div>
+                <div class="form-group"><label for="optimizer-args">Optimizer Args（key=value、スペース区切り）</label><input type="text" id="optimizer-args" placeholder="例: decouple=True weight_decay=0.01"></div>
+                <div class="form-group"><label for="seed">Training seed（空欄なら開始時に生成）</label><input type="number" id="seed" placeholder="random"></div>
+            </div>
+
+            <div class="card">
+                <h3>Epoch Samples / 学習途中サンプル</h3>
+                <div class="form-group"><label for="sample-prompts">Sample Prompt（複数行で複数Prompt）</label><textarea id="sample-prompts" rows="3" placeholder="a portrait of the character, high quality"></textarea></div>
+                <div class="form-group"><label for="sample-negative">Negative Prompt</label><textarea id="sample-negative" rows="2" placeholder="low quality, blurry, bad anatomy"></textarea></div>
+                <div class="form-grid four-columns">
+                    <div><label for="sample-seed">Seed</label><input type="number" id="sample-seed" value="12345"></div>
+                    <div><label for="sample-steps">Steps</label><input type="number" id="sample-steps" value="20" min="1"></div>
+                    <div><label for="sample-width">Width</label><input type="number" id="sample-width" value="1024" min="64" step="8"></div>
+                    <div><label for="sample-height">Height</label><input type="number" id="sample-height" value="1024" min="64" step="8"></div>
+                </div>
+                <div class="form-grid two-columns">
+                    <div><label for="sample-sampler">Sampler</label><select id="sample-sampler"><option value="euler_a" selected>euler_a</option><option value="euler">euler</option><option value="ddim">ddim</option><option value="dpm_2">dpm_2</option><option value="dpmsolver++">dpmsolver++</option></select></div>
+                    <div><label for="sample-every">Sample every N epochs（0で無効）</label><input type="number" id="sample-every" value="1" min="0"></div>
+                </div>
+                <label class="checkbox-line"><input type="checkbox" id="sample-at-first" checked><span>学習開始前にもsampleを生成 / Sample at first</span></label>
+            </div>
+
+            <div class="card">
+                <h3>Output sync / Google Drive</h3>
+                <div class="form-group"><label for="gdrive-output-path">Google Drive Output Path</label><input type="text" id="gdrive-output-path" placeholder="sdxl_lora/outputs/my_sdxl_lora"></div>
+                <label class="checkbox-line"><input type="checkbox" id="auto-sync-output"><span>学習完了（失敗時もsummary/logがあれば）後にGoogle Driveへ自動同期</span></label>
+            </div>
+
+            <div class="card repair-card">
+                <button id="setup-scripts-btn" class="btn btn-secondary" onclick="setupScripts()">学習環境の再構築 / Repair Environment</button>
+                <span id="setup-progress-text" class="muted">sd-scriptsは同梱済み。依存関係の再インストールが必要な場合のみ実行してください。</span>
+            </div>
+        </section>
+
+        <!-- Training -->
+        <section id="tab-train" class="tab-content" hidden>
+            <h2>トレーニング実行 / Execution</h2>
+            <div class="card training-progress-card">
+                <div class="stats-grid">
+                    <div><span>Epoch</span><strong id="train-epoch">—</strong></div>
+                    <div><span>Step</span><strong id="train-step">—</strong></div>
+                    <div><span>Loss</span><strong id="train-loss">—</strong></div>
+                    <div><span>Average</span><strong id="train-average-loss">—</strong></div>
+                    <div><span>Learning rate</span><strong id="train-learning-rate">—</strong></div>
+                </div>
+                <div id="job-info" class="status-box">学習待機中 / Ready</div>
+            </div>
+            <div class="card">
+                <div id="console-output" class="console-output">待機中... (Waiting to start)</div>
+                <div class="button-row training-actions">
+                    <button class="btn btn-primary" id="start-train-btn" onclick="startTraining()">🚀 LoRA学習開始 / Start Training</button>
+                    <button class="btn btn-danger" id="cancel-train-btn" onclick="cancelTraining()" disabled>停止 / Stop</button>
+                </div>
+                <label class="checkbox-line"><input type="checkbox" id="auto-shutdown"><span>Windowsで完了後にシャットダウン（RunPod/Linuxでは無視）</span></label>
+            </div>
+            <div class="card">
+                <div class="card-heading"><h3>Output files</h3><button class="btn btn-secondary" onclick="syncOutput()">☁️ 出力をGoogle Driveへ同期</button></div>
+                <div id="output-files" class="file-list muted">学習完了後に表示されます。</div>
+                <div id="output-sync-status" class="inline-status"></div>
+            </div>
+        </section>
+    </main>
+
+    <script src="app.js?v=5.0"></script>
+</body>
+
+</html>

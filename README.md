@@ -67,6 +67,47 @@ People who do not have a GPU (or have an AMD/Intel GPU).</code>
 
 ---
 
+## RunPod / Linux Web App
+
+v5.0 adds a browser workflow for copying a dataset from Google Drive into the Pod, editing captions, training SDXL LoRA, and copying results back. The backend listens on `0.0.0.0` so it can be opened through the RunPod HTTP Proxy. Dataset and result transfers use `rclone copy`; the app never runs a destructive `rclone sync` for these workflows.
+
+### RunPod quick start
+
+1. Start a Pod with an NVIDIA GPU and open a terminal.
+2. Clone this repository into `/workspace/SDXL-LoRA-Factory`.
+3. Install/configure `rclone` and create a Google Drive remote named `gdrive` (or set `GDRIVE_REMOTE`). Keep `rclone.conf` outside Git, for example at `/workspace/rclone/rclone.conf`.
+4. Set the environment variables below. The defaults match a standard Pod layout.
+5. Install dependencies in the Pod image, or run `AUTO_SETUP=1 ./start.sh` for the optional setup check. A manual install is:
+   `python3 -m pip install -r backend/requirements.txt && python3 -m pip install -r backend/sd-scripts/requirements.txt`.
+6. Run `./start.sh`, then open the Pod's HTTP Proxy URL for port `8001`.
+7. Enter a Drive dataset path such as `sdxl_lora/datasets/my_character` and click **DatasetをPodへ同期**.
+8. Open the Tag Editor, run WD14, edit captions, apply batch changes/Trigger Word, and click caption sync.
+9. Configure the base model, epochs, repeats, LoRA settings, and fixed epoch sample settings.
+10. Start training. Each epoch is saved with `--save_every_n_epochs=1`; samples use sd-scripts' `--sample_at_first` and `--sample_every_n_epochs=1` defaults.
+11. When training finishes, review the live log, Loss history, epoch LoRAs, samples, and `training_summary.txt`. Enable or manually run output sync to copy them to Drive.
+
+Example environment:
+
+```bash
+export APP_HOST=0.0.0.0
+export APP_PORT=8001
+export WORKSPACE_ROOT=/workspace
+export LOCAL_DATA_ROOT=/workspace/data
+export LOCAL_OUTPUT_ROOT=/workspace/output
+export LOCAL_JOB_ROOT=/workspace/jobs
+export RCLONE_CONFIG=/workspace/rclone/rclone.conf
+export GDRIVE_REMOTE=gdrive
+./start.sh
+```
+
+The same values can be copied from `.env.example` into the Pod environment. The app creates `/workspace/data`, `/workspace/output`, `/workspace/jobs`, and `/workspace/config` as needed. A training job is isolated under `/workspace/jobs/<job_id>` and `/workspace/output/<job_id>`, with `lora/`, `samples/`, `logs/`, and `training_summary.txt` inside the output directory. The summary is also written when training fails, including the error and any Loss data already collected.
+
+### RunPod troubleshooting
+
+The system status card reports missing `rclone`, a missing `rclone.conf`, a missing Drive remote, and GPU/PyTorch information. Dataset, model, WD14, sample, training, and output-sync errors are shown in the UI and retained in the job log/summary where possible. On Linux the desktop Browse dialogs are intentionally disabled; enter Pod paths manually. `WD14_ALLOW_MOCK=true` is available only for a local smoke test and should not be used for real captions.
+
+The original Windows `start.bat` workflow and Windows-oriented usage notes below are retained.
+
 <a id="english"></a>
 
 # English
