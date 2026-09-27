@@ -1,0 +1,47 @@
+# RunPod-only dependency set.
+#
+# The RunPod PyTorch image owns torch, torchvision, CUDA, and the matching
+# low-level packages.  This file intentionally does not mention torch or
+# torchvision.  bootstrap.sh verifies that the base image already provides
+# them, then installs only the Factory/sd-scripts dependencies below.
+
+fastapi>=0.115,<1
+uvicorn[standard]>=0.30,<1
+python-multipart>=0.0.9,<1
+toml==0.10.2
+websockets>=12,<16
+huggingface-hub==0.34.3
+Pillow>=10,<12
+numpy>=1.26,<2.1
+pandas>=2,<3
+diffusers==0.32.1
+accelerate==1.6.0
+transformers>=4.44,<5
+voluptuous>=0.15,<1
+imagesize==1.4.1
+rich>=13,<15
+ftfy==6.3.1
+albumentations>=1.4,<2
+einops==0.7.0
+colorama>=0.4,<1
+tqdm>=4.66,<5
+lion-pytorch==0.2.3
+lycoris-lora>=2,<3
+dadaptation>=3,<4
+prodigyopt>=1,<2
+tensorboard>=2.15,<3
+
+# sd-scripts dependencies, excluding its diffusers[torch] extra and editable
+# package install.  The package itself is installed with --no-deps by
+# bootstrap.sh so pip cannot decide to replace the base image's Torch.
+opencv-python==4.10.0.84
+bitsandbytes>=0.43,<1
+schedulefree==1.4
+pytorch-optimizer==3.10.0
+prodigy-plus-schedule-free==1.9.2
+safetensors==0.4.5
+sentencepiece==0.2.1
+
+# WD14 on NVIDIA Linux.  The range allows the wheel to follow the Python/CUDA
+# ABI of the selected RunPod image without installing the CPU distribution.
+onnxruntime-gpu>=1.17,<2

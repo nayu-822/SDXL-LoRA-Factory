@@ -127,6 +127,11 @@ def write_training_summary(path: Path, data: dict) -> Path:
     lines.extend(["", "[OUTPUT SYNC]"])
     output_sync = data.get("output_sync") or {"enabled": False, "status": "not_requested"}
     _write_pairs(lines, output_sync)
+    lines.extend(["", "[GDRIVE BACKUP]"])
+    gdrive_backup = data.get("gdrive_backup") or {"enabled": False, "status": "not_requested"}
+    _write_pairs(lines, gdrive_backup)
+    lines.extend(["", "[PATHS]"])
+    _write_pairs(lines, data.get("paths", {}))
     lines.extend(["", "[WARNINGS]"])
     warnings = data.get("warnings", [])
     lines.extend(f"- {item}" for item in warnings)

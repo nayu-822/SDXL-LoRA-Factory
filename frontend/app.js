@@ -6,6 +6,8 @@ const appState = {
     socket: null,
     reconnectTimer: null,
     pollingTimer: null,
+    captionSyncTimer: null,
+    isRunPod: false,
 };
 
 const storagePrefix = 'sdxl_factory_';
@@ -118,19 +120,69 @@ document.querySelectorAll('.nav-item').forEach(item => {
 async function checkSystemStatus() {
     try {
         const data = await api('/api/system/status');
+        appState.isRunPod = data.settings?.platform === 'linux';
         const rclone = data.rclone || {};
         const gdrive = data.gdrive || {};
-        const ready = rclone.executable?.available && rclone.config?.exists && !gdrive.error;
+        const driveDisabled = data.settings?.gdrive_enabled === false || rclone.enabled === false;
+        const ready = driveDisabled || (rclone.executable?.available && rclone.config?.exists && !gdrive.error);
         const dot = byId('system-status-dot');
         if (dot) dot.classList.toggle('ready', Boolean(ready));
-        setText('system-status-text', ready ? 'GDrive接続準備完了' : 'GDrive設定を確認してください');
-        setText('system-summary', `${data.settings?.workspace_root || 'workspace'} · rclone: ${ready ? 'ready' : '未設定'}`);
+        setText('system-status-text', driveDisabled ? 'GDriveバックアップ無効' : ready ? 'GDrive接続準備完了' : 'GDrive設定を確認してください');
+        setText('system-summary', `${data.settings?.data_root_base || data.settings?.data_root || 'data'} · Model: ${data.models?.models?.length || 0} · rclone: ${driveDisabled ? 'disabled' : ready ? 'ready' : '未設定'}`);
         if (data.gpu) setText('gpu-info-display', `${data.gpu.name} (VRAM: ${data.gpu.memory})`);
+        if (data.models) updateModelStatus(data.models);
         if (!ready && gdrive.error) {
             setStatus('dataset-sync-status', `${gdrive.error.code}: ${gdrive.error.message}`, 'error');
         }
     } catch (error) {
         setText('system-status-text', 'Backend接続エラー');
+        showError(error);
+    }
+}
+
+function updateModelStatus(data) {
+    const status = byId('model-directory-status');
+    if (status) {
+        status.textContent = data.error
+            ? `${data.model_dir}: ${data.error}`
+            : `${data.model_dir} · ${data.models.length} model(s) · 読み取り専用`;
+    }
+    const select = byId('model-select');
+    if (!select) return;
+    const manualInput = byId('model-path');
+    const browseButton = byId('model-browse-btn');
+    if (manualInput) manualInput.disabled = appState.isRunPod;
+    if (browseButton) browseButton.disabled = appState.isRunPod;
+    if (manualInput && appState.isRunPod) {
+        manualInput.placeholder = 'RunPod/Linuxでは上のモデル一覧から選択してください';
+    }
+    const current = getValue('model-path').trim();
+    select.replaceChildren();
+    if (!data.models?.length) {
+        const empty = document.createElement('option');
+        empty.value = '';
+        empty.textContent = data.error || 'モデルがありません（手動パスも入力できます）';
+        select.appendChild(empty);
+        return;
+    }
+    const manual = document.createElement('option');
+    manual.value = '';
+    manual.textContent = 'モデルを選択してください';
+    select.appendChild(manual);
+    data.models.forEach(model => {
+        const option = document.createElement('option');
+        option.value = model.path;
+        option.textContent = `${model.name} (${model.relative_path})`;
+        select.appendChild(option);
+    });
+    if (current) select.value = current;
+}
+
+async function loadBaseModels() {
+    try {
+        updateModelStatus(await api('/api/base-models'));
+    } catch (error) {
+        setText('model-directory-status', error.message);
         showError(error);
     }
 }
@@ -301,6 +353,7 @@ async function saveTags(container) {
         await api('/api/dataset/update-tags', jsonOptions({ path, tags }));
         const status = byId('caption-sync-status');
         if (status) status.textContent = 'ローカルcaptionを保存済み / Local caption saved';
+        scheduleCaptionBackup();
     } catch (error) {
         showError(error);
     }
@@ -334,6 +387,7 @@ async function runBatchTags(position, rawTags) {
         const data = await api('/api/dataset/batch-tags', jsonOptions({ path, tags, position }));
         alert(`${data.images_changed} images changed / ${position}`);
         await loadDataset(path);
+        scheduleCaptionBackup();
     } catch (error) {
         showError(error);
     }
@@ -347,6 +401,7 @@ async function batchAddTriggerWords() {
         const data = await api('/api/dataset/trigger-word', jsonOptions({ path, trigger_word: trigger }));
         alert(`Trigger Wordを${data.images_changed} imagesの先頭へ追加しました。`);
         await loadDataset(path);
+        scheduleCaptionBackup();
     } catch (error) {
         showError(error);
     }
@@ -389,6 +444,19 @@ async function syncCaptions() {
         setStatus('caption-sync-status', error.message, 'error');
         showError(error);
     }
+}
+
+function scheduleCaptionBackup() {
+    if (!isChecked('tagger-auto-sync')) return;
+    const path = appState.datasetPath || getValue('dataset-path').trim();
+    const gdrivePath = appState.gdriveDatasetPath || getValue('gdrive-dataset-path').trim();
+    if (!path || !gdrivePath) return;
+    if (appState.captionSyncTimer) clearTimeout(appState.captionSyncTimer);
+    setStatus('caption-sync-status', 'captionバックアップを準備中...', 'running');
+    appState.captionSyncTimer = setTimeout(() => {
+        appState.captionSyncTimer = null;
+        syncCaptions().catch(showError);
+    }, 900);
 }
 
 function updateTrainingProgress(progress = {}) {
@@ -447,6 +515,7 @@ function trainingPayload() {
         sample_at_first: isChecked('sample-at-first'),
         gdrive_dataset_path: appState.gdriveDatasetPath || getValue('gdrive-dataset-path').trim(),
         gdrive_output_path: getValue('gdrive-output-path').trim(),
+        gdrive_backup_enabled: isChecked('auto-sync-output'),
         auto_sync_output: isChecked('auto-sync-output'),
         shutdown: isChecked('auto-shutdown'),
     };
@@ -536,6 +605,15 @@ function handleStatus(channel, status) {
                     : 'Output同期中...';
             setStatus('output-sync-status', syncLabel, outputSync.status === 'failed' ? 'error' : outputSync.status === 'completed' ? 'success' : 'running');
         }
+        const backup = status.gdrive_backup || {};
+        if (backup.enabled) {
+            const label = backup.status === 'completed'
+                ? `Google Driveバックアップ完了 (${backup.phase || 'finish'})`
+                : backup.status === 'failed'
+                    ? `Google Driveバックアップ失敗: ${backup.error || 'unknown error'}`
+                    : `Google Driveバックアップ中 (${backup.phase || 'start'})`;
+            setStatus('gdrive-backup-status', label, backup.status === 'failed' ? 'error' : backup.status === 'completed' ? 'success' : 'running');
+        }
         if (['completed', 'failed', 'cancelled'].includes(status.status)) {
             const button = byId('start-train-btn');
             if (button) { button.disabled = false; button.textContent = '🚀 LoRA学習開始 / Start Training'; }
@@ -574,6 +652,8 @@ function handleStatus(channel, status) {
             setStatus('caption-sync-status', label, status.status === 'failed' ? 'error' : status.status === 'completed' ? 'success' : 'running');
         } else if (operation === 'output') {
             setStatus('output-sync-status', label, status.status === 'failed' ? 'error' : status.status === 'completed' ? 'success' : 'running');
+        } else if (operation === 'backup') {
+            setStatus('gdrive-backup-status', label, status.status === 'failed' ? 'error' : status.status === 'completed' ? 'success' : 'running');
         }
     }
 }
@@ -669,6 +749,14 @@ document.addEventListener('DOMContentLoaded', () => {
     loadSavedFields();
     connectWebSocket();
     checkSystemStatus();
+    loadBaseModels();
+    byId('model-select')?.addEventListener('change', event => {
+        const value = event.target.value;
+        if (value) {
+            byId('model-path').value = value;
+            saveField('model-path');
+        }
+    });
     api('/api/check-scripts').then(data => {
         if (!data.exists) setText('setup-progress-text', `sd-scriptsが見つかりません: ${data.entrypoint}`);
     }).catch(console.warn);

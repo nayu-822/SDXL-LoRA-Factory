@@ -108,6 +108,9 @@ class TrainingConfig(BaseModel):
     # Drive integration.
     gdrive_dataset_path: str = ""
     gdrive_output_path: str = ""
+    # Per-run Linux/RunPod switch.  Windows retains the existing
+    # ``auto_sync_output`` behavior for compatibility.
+    gdrive_backup_enabled: bool = False
     auto_sync_output: bool = False
 
     # Kept for Windows compatibility. RunPod deliberately ignores shutdown.

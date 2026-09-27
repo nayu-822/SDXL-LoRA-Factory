@@ -21,11 +21,11 @@ from .models import OutputSyncRequest, TrainingConfig
 from .paths import (
     dataset_counts,
     image_files,
-    normalize_local_path,
     safe_slug,
     validate_local_dataset,
     validate_model_reference,
     validate_optional_model_path,
+    validate_output_path,
 )
 from .processes import ProcessManager, ProcessRun
 from .summary import write_training_summary
@@ -45,6 +45,21 @@ def _model_dict(model) -> dict:
 def _number(value) -> str:
     number = float(value)
     return str(int(number)) if number.is_integer() else str(number)
+
+
+def build_gdrive_run_path(config: TrainingConfig, settings: Settings, run_id: str) -> str:
+    """Resolve the Drive folder for one run without embedding credentials."""
+
+    configured = config.gdrive_output_path.strip()
+    if configured:
+        if os.name == "nt":
+            # Preserve the existing Windows output-sync destination.  RunPod
+            # always receives a unique suffix below.
+            return configured.replace("{RUN_ID}", run_id).replace("{run_id}", run_id)
+        if "{RUN_ID}" in configured or "{run_id}" in configured:
+            return configured.replace("{RUN_ID}", run_id).replace("{run_id}", run_id)
+        return f"{configured.rstrip('/')}/{run_id}"
+    return f"{settings.gdrive_root.rstrip('/')}/{run_id}"
 
 
 def build_dataset_toml(image_dir: Path, repeats: int, width: int, height: int, min_bucket: int, max_bucket: int) -> str:
@@ -218,12 +233,19 @@ class TrainingService:
         if config.seed is None:
             config.seed = random.randint(0, 2**32 - 1)
         job_id = f"{name}-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
-        job_dir = self.settings.job_root / job_id
-        output_parent = normalize_local_path(config.output_dir, self.settings) if config.output_dir.strip() else self.settings.output_root
+        # Config/manifest files and process logs live in their dedicated
+        # volatile /data trees.  Keep output files separate so the Drive
+        # backup can reproduce the run as lora/captions/config/logs.
+        job_dir = self.settings.config_root / job_id
+        output_parent = (
+            validate_output_path(config.output_dir, self.settings)
+            if config.output_dir.strip()
+            else validate_output_path(str(self.settings.output_root), self.settings)
+        )
         output_dir = output_parent / job_id
         lora_dir = output_dir / "lora"
         samples_dir = output_dir / "samples"
-        logs_dir = output_dir / "logs"
+        logs_dir = self.settings.job_root / job_id
         for path in (job_dir, lora_dir, samples_dir, logs_dir):
             path.mkdir(parents=True, exist_ok=True)
 
@@ -254,8 +276,15 @@ class TrainingService:
         )
         (job_dir / "command.json").write_text(json.dumps(command, ensure_ascii=False, indent=2), encoding="utf-8")
         (job_dir / "command.txt").write_text(shlex.join(command) + "\n", encoding="utf-8")
+        (job_dir / "training_config.json").write_text(
+            json.dumps(_model_dict(config), ensure_ascii=False, indent=2, default=str), encoding="utf-8"
+        )
 
-        gdrive_output_path = config.gdrive_output_path.strip() or f"sdxl_lora/outputs/{name}"
+        gdrive_output_path = build_gdrive_run_path(config, self.settings, job_id)
+        # The structured run backup is the RunPod/Linux addition.  Windows
+        # keeps the existing auto_sync_output flow below, even though the
+        # shared frontend sends both compatibility flags.
+        backup_requested = bool(config.gdrive_backup_enabled) and os.name != "nt"
         state = {
             "job_id": job_id,
             "job_name": name,
@@ -268,8 +297,15 @@ class TrainingService:
             "output_dir": str(output_dir),
             "lora_dir": str(lora_dir),
             "samples_dir": str(samples_dir),
+            "logs_dir": str(logs_dir),
             "job_dir": str(job_dir),
             "gdrive_output_path": gdrive_output_path,
+            "gdrive_run_path": gdrive_output_path,
+            "gdrive_backup": {
+                "enabled": backup_requested,
+                "status": "pending" if backup_requested else "not_requested",
+                "gdrive_path": gdrive_output_path,
+            },
             "config": _model_dict(config),
             "command": command,
             "progress": LossParser().progress(),
@@ -281,6 +317,30 @@ class TrainingService:
         }
         self.states[job_id] = state
         self._persist(state)
+        if backup_requested and self.sync_service is not None:
+            try:
+                backup_dir = self.sync_service.prepare_run_backup(
+                    job_id,
+                    dataset_path,
+                    job_dir,
+                    output_dir,
+                    logs_dir,
+                )
+                state["backup_dir"] = str(backup_dir)
+                self._persist(state)
+                await self._run_structured_backup(state, "start")
+            except Exception as error:
+                # Drive is a backup destination, never a prerequisite for
+                # starting the local training process.
+                state["gdrive_backup"] = {
+                    "enabled": True,
+                    "status": "failed",
+                    "phase": "start",
+                    "gdrive_path": gdrive_output_path,
+                    "error": str(error),
+                }
+                state["warnings"].append(f"Google Drive start backup failed: {error}")
+                self._persist(state)
         parser = LossParser()
 
         async def on_line(run: ProcessRun, line: str) -> None:
@@ -308,6 +368,10 @@ class TrainingService:
             except Exception as error:
                 state["warnings"].append(f"TensorBoard loss parsing failed: {error}")
             state["loss_history"] = parser.as_dict()
+            (logs_dir / "loss_history.json").write_text(
+                json.dumps(state["loss_history"], ensure_ascii=False, indent=2, default=str),
+                encoding="utf-8",
+            )
             if run.error and run.error not in state["errors"]:
                 state["errors"].append(run.error)
             if run.status == "succeeded":
@@ -354,7 +418,56 @@ class TrainingService:
             self._persist(state)
             await self.hub.status("train", self._public_state(state), job_id)
 
-            if config.auto_sync_output:
+            if backup_requested:
+                try:
+                    if self.sync_service is None:
+                        raise RuntimeError("Google Drive backup service is unavailable")
+                    backup_dir = self.sync_service.prepare_run_backup(
+                        job_id,
+                        dataset_path,
+                        job_dir,
+                        Path(state["output_dir"]),
+                        logs_dir,
+                    )
+                    state["backup_dir"] = str(backup_dir)
+                    await self._run_structured_backup(state, "finish")
+                    if state["gdrive_backup"].get("status") != "completed":
+                        state["warnings"].append("Google Drive run backup failed")
+                except Exception as error:
+                    state["gdrive_backup"] = {
+                        "enabled": True,
+                        "status": "failed",
+                        "phase": "finish",
+                        "gdrive_path": gdrive_output_path,
+                        "error": str(error),
+                    }
+                    state["warnings"].append(f"Google Drive run backup failed: {error}")
+                # The final summary records whether training and backup each
+                # succeeded, so the two outcomes are never conflated. Write
+                # it before copying the summary-only refresh to Drive.
+                write_summary()
+                backup_dir = Path(state.get("backup_dir", ""))
+                if backup_dir.is_dir() and self.sync_service is not None:
+                    try:
+                        staged_summary = backup_dir / "logs" / "training_summary.txt"
+                        staged_summary.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(summary_path, staged_summary)
+                        summary_state, summary_run = await self.sync_service.start_run_backup_file(
+                            staged_summary,
+                            f"{gdrive_output_path.rstrip('/')}/logs",
+                        )
+                        await self.manager.wait(summary_run)
+                        if summary_state.get("status") != "completed":
+                            state["warnings"].append("Google Drive final summary copy failed")
+                    except AttributeError:
+                        # Third-party/test sync adapters from the old API may
+                        # not provide the summary-only method.
+                        pass
+                    except Exception as error:
+                        state["warnings"].append(f"Google Drive final summary copy failed: {error}")
+                self._persist(state)
+                await self.hub.status("train", self._public_state(state), job_id)
+            elif config.auto_sync_output:
                 try:
                     if self.sync_service is None:
                         raise RuntimeError("output sync service is unavailable")
@@ -378,7 +491,22 @@ class TrainingService:
                     }
                     state["warnings"].append(f"automatic output sync failed: {error}")
                 # Replace the provisional summary so the final sync result is
-                # available to both the UI and downstream diagnostics.
+                # available to both the UI and downstream diagnostics, then
+                # copy that final summary once more to Drive.
+                write_summary()
+                if self.sync_service is not None:
+                    try:
+                        summary_state, summary_run = await self.sync_service.start_output_file(
+                            summary_path,
+                            gdrive_output_path,
+                        )
+                        await self.manager.wait(summary_run)
+                        if summary_state.get("status") != "completed":
+                            state["warnings"].append("Google Drive final summary copy failed")
+                    except AttributeError:
+                        pass
+                    except Exception as error:
+                        state["warnings"].append(f"Google Drive final summary copy failed: {error}")
                 write_summary()
                 self._persist(state)
                 await self.hub.status("train", self._public_state(state), job_id)
@@ -411,6 +539,29 @@ class TrainingService:
         self._persist(state)
         await self.hub.status("train", self._public_state(state), job_id)
         return state, run
+
+    async def _run_structured_backup(self, state: dict, phase: str) -> dict:
+        """Run one non-destructive Drive copy and update its separate status."""
+
+        if self.sync_service is None:
+            raise RuntimeError("Google Drive backup service is unavailable")
+        backup_dir = Path(state.get("backup_dir", ""))
+        if not backup_dir.is_dir():
+            raise RuntimeError(f"run backup staging directory does not exist: {backup_dir}")
+        sync_state, sync_run = await self.sync_service.start_run_backup(
+            backup_dir,
+            state["gdrive_run_path"],
+        )
+        await self.manager.wait(sync_run)
+        state["gdrive_backup"] = {
+            "enabled": True,
+            "phase": phase,
+            "gdrive_path": state["gdrive_run_path"],
+            **sync_state,
+        }
+        self._persist(state)
+        await self.hub.status("train", self._public_state(state), state["job_id"])
+        return state["gdrive_backup"]
 
     def _postprocess(self, state: dict, config: TrainingConfig, success: bool) -> dict:
         output_dir = Path(state["output_dir"])
@@ -567,6 +718,15 @@ class TrainingService:
             },
             "output_files": list(state.get("output_files", [])),
             "output_sync": dict(state.get("output_sync", {})),
+            "gdrive_backup": dict(state.get("gdrive_backup", {})),
+            "paths": {
+                "dataset_dir": str(self.settings.data_root),
+                "config_dir": str(state.get("job_dir", "")),
+                "output_dir": str(state.get("output_dir", "")),
+                "log_dir": str(state.get("logs_dir", "")),
+                "cache_dir": str(self.settings.cache_directory),
+                "model_dir": str(self.settings.model_directory),
+            },
             "step_loss_summary_limit": 800,
             "warnings": list(dict.fromkeys(state.get("warnings", []))),
             "errors": list(dict.fromkeys(state.get("errors", []))),

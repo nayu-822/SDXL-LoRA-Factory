@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.metadata
+import os
 import shutil
 import subprocess
 import sys
@@ -170,6 +171,19 @@ def main() -> int:
     print("=" * 60)
     print("  SDXL LoRA Factory - Environment Setup Check")
     print("=" * 60)
+    if os.environ.get("RUNPOD_PRESERVE_TORCH", "").strip().lower() in {"1", "true", "yes", "on"}:
+        print("[SETUP] RUNPOD_PRESERVE_TORCH=1; existing PyTorch/CUDA will not be installed or changed.")
+        if not check_sd_scripts():
+            return 1
+        try:
+            import torch
+
+            print(f"[INFO] Preserved PyTorch {torch.__version__}; CUDA available: {torch.cuda.is_available()}")
+        except ImportError as error:
+            print(f"[ERROR] RunPod base image does not provide PyTorch: {error}")
+            return 1
+        print("[SETUP] RunPod setup check completed without changing Torch/CUDA packages.")
+        return 0
     if not check_sd_scripts():
         return 1
     if not check_pytorch():

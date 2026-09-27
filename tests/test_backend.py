@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import shutil
 import unittest
 import uuid
 from dataclasses import replace
 from pathlib import Path
+from unittest import mock
 
 from backend.app.config import Settings
 from backend.app.events import EventHub
@@ -17,14 +19,16 @@ from backend.app.paths import (
     dataset_counts,
     dataset_directory_for_name,
     gdrive_uri,
+    list_base_models,
     normalize_local_path,
     validate_gdrive_path,
     validate_image_path,
     validate_local_dataset,
 )
 from backend.app.recommendations import recommend_settings
-from backend.app.rclone_sync import RcloneService
+from backend.app.rclone_sync import RcloneError, RcloneService
 from backend.app.summary import representative_step_records, write_training_summary
+from backend.app.sync import SyncService
 from backend.app.tag_ops import (
     batch_remove_tags,
     batch_update_tags,
@@ -32,7 +36,13 @@ from backend.app.tag_ops import (
     read_tags,
     update_image_tags,
 )
-from backend.app.training import TrainingService, build_dataset_toml, build_sample_prompts, build_training_command
+from backend.app.training import (
+    TrainingService,
+    build_dataset_toml,
+    build_gdrive_run_path,
+    build_sample_prompts,
+    build_training_command,
+)
 from backend.bundled_tagger import run_mock_tagger
 
 
@@ -120,6 +130,133 @@ class BackendContractTests(unittest.TestCase):
         external_image.write_bytes(b"fixture")
         with self.assertRaises(ValueError):
             validate_image_path(str(external_image), restricted)
+
+    def test_base_model_catalog_scans_only_readable_checkpoint_files(self) -> None:
+        model_dir = self.settings.model_directory
+        model_dir.mkdir(parents=True)
+        (model_dir / "waiIllustriousSDXL.safetensors").write_bytes(b"model")
+        (model_dir / "notes.txt").write_text("ignore", encoding="utf-8")
+        nested = model_dir / "nested"
+        nested.mkdir()
+        (nested / "base.ckpt").write_bytes(b"checkpoint")
+
+        catalog = list_base_models(self.settings)
+
+        self.assertTrue(catalog["exists"])
+        self.assertEqual([item["name"] for item in catalog["models"]], ["base.ckpt", "waiIllustriousSDXL.safetensors"])
+        self.assertEqual(catalog["models"][0]["relative_path"], "nested/base.ckpt")
+        self.assertEqual((model_dir / "notes.txt").read_text(encoding="utf-8"), "ignore")
+
+    def test_runpod_defaults_use_data_and_shared_model_paths(self) -> None:
+        values = {
+            "WORKSPACE_ROOT": "/workspace",
+            "MODEL_DIR": "/workspace/models/checkpoints",
+            "DATA_ROOT": "/data",
+            "LOCAL_DATA_ROOT": "/data/dataset",
+            "LOCAL_OUTPUT_ROOT": "/data/output",
+            "LOCAL_JOB_ROOT": "/data/jobs",
+            "LOCAL_CONFIG_ROOT": "/data/config",
+            "CACHE_DIR": "/data/cache",
+            "RCLONE_CONFIG": "/data/rclone/rclone.conf",
+        }
+        with mock.patch.dict(os.environ, values, clear=False):
+            settings = Settings.from_env()
+        self.assertEqual(settings.model_directory.as_posix(), "/workspace/models/checkpoints")
+        self.assertEqual(settings.data_root.as_posix(), "/data/dataset")
+        self.assertEqual(settings.output_root.as_posix(), "/data/output")
+        self.assertEqual(settings.job_root.as_posix(), "/data/jobs")
+        self.assertEqual(settings.config_root.as_posix(), "/data/config")
+        self.assertEqual(settings.cache_directory.as_posix(), "/data/cache")
+        self.assertEqual(settings.rclone_config.as_posix(), "/data/rclone/rclone.conf")
+
+    def test_runpod_output_cannot_use_model_directory(self) -> None:
+        from backend.app.paths import validate_output_path
+
+        model_dir = self.root / "models" / "checkpoints"
+        model_dir.mkdir(parents=True)
+        restricted = replace(self.settings, model_dir=model_dir)
+        with mock.patch("backend.app.paths.os.name", "posix"):
+            with self.assertRaisesRegex(ValueError, "MODEL_DIR"):
+                validate_output_path(str(model_dir / "run-1"), restricted)
+
+    def test_structured_run_backup_has_expected_categories_and_copy_command(self) -> None:
+        config_dir = self.settings.config_root / "job-1"
+        output_dir = self.settings.output_root / "job-1" / "lora"
+        logs_dir = self.settings.job_root / "job-1"
+        config_dir.mkdir(parents=True)
+        output_dir.mkdir(parents=True)
+        logs_dir.mkdir(parents=True)
+        samples_dir = output_dir.parent / "samples"
+        samples_dir.mkdir(parents=True)
+        (config_dir / "training_config.json").write_text("{}", encoding="utf-8")
+        (output_dir / "demo.safetensors").write_bytes(b"lora")
+        (samples_dir / "epoch-1.png").write_bytes(b"sample")
+        (logs_dir / "training.log").write_text("loss=0.1", encoding="utf-8")
+        (self.dataset / "001.txt").write_text("my_trigger, 1girl", encoding="utf-8")
+
+        service = SyncService(self.settings, RcloneService(self.settings), None, EventHub())
+        backup = service.prepare_run_backup("run-1", self.dataset, config_dir, output_dir.parent, logs_dir)
+
+        self.assertEqual(
+            {path.relative_to(backup).as_posix() for path in backup.rglob("*") if path.is_file()},
+            {
+                "captions/001.txt",
+                "config/training_config.json",
+                "lora/demo.safetensors",
+                "logs/training.log",
+                "samples/epoch-1.png",
+            },
+        )
+        command = service.rclone.backup_command(backup, "SDXL-LoRA-Factory/runs/run-1")
+        self.assertEqual(command[3], "copy")
+        self.assertNotIn("sync", command)
+
+    def test_tensorboard_events_are_in_output_copy_patterns(self) -> None:
+        command = RcloneService(self.settings).output_command(self.root / "output", "runs/demo")
+        self.assertIn("events.out.tfevents.*", command)
+
+    def test_run_path_always_gets_a_unique_suffix_on_runpod(self) -> None:
+        config = TrainingConfig(
+            path=str(self.dataset),
+            model="stabilityai/stable-diffusion-xl-base-1.0",
+            gdrive_output_path="SDXL-LoRA-Factory/runs/my_sdxl_lora",
+        )
+        with mock.patch("backend.app.training.os.name", "posix"):
+            first = build_gdrive_run_path(config, self.settings, "my_sdxl_lora-1")
+            second = build_gdrive_run_path(config, self.settings, "my_sdxl_lora-2")
+        self.assertNotEqual(first, second)
+        self.assertTrue(first.endswith("/my_sdxl_lora-1"))
+        self.assertTrue(second.endswith("/my_sdxl_lora-2"))
+
+    def test_gdrive_disabled_fails_only_when_drive_operation_is_requested(self) -> None:
+        service = RcloneService(replace(self.settings, gdrive_enabled=False))
+        with self.assertRaises(RcloneError) as context:
+            asyncio.run(service.check_remote())
+        self.assertEqual(context.exception.code, "gdrive_disabled")
+
+    def test_training_can_start_without_rclone_when_drive_is_disabled(self) -> None:
+        class StubManager:
+            async def start(self, **kwargs):
+                return ProcessRun(
+                    run_id=kwargs["run_id"],
+                    kind=kwargs["kind"],
+                    command=kwargs["command"],
+                    log_path=kwargs["log_path"],
+                )
+
+        class ExplodingSync:
+            def __getattr__(self, name):
+                raise AssertionError(f"Drive operation should not be called: {name}")
+
+        service = TrainingService(self.settings, StubManager(), EventHub(), ExplodingSync())
+        config = TrainingConfig(
+            path=str(self.dataset),
+            model="stabilityai/stable-diffusion-xl-base-1.0",
+            gdrive_backup_enabled=False,
+            auto_sync_output=False,
+        )
+        state, _ = asyncio.run(service.start(config))
+        self.assertEqual(state["gdrive_backup"]["status"], "not_requested")
 
     def test_rclone_commands_are_copy_only(self) -> None:
         service = RcloneService(self.settings)
@@ -392,6 +529,64 @@ class BackendContractTests(unittest.TestCase):
         self.assertIn("status=failed", summary.split("[OUTPUT SYNC]", 1)[1])
         self.assertIn("remote unavailable", summary)
         self.assertIn("automatic output sync failed", summary)
+
+    def test_final_summary_is_copied_after_output_sync_result_is_known(self) -> None:
+        test_root = self.root
+
+        class StubManager:
+            def __init__(self) -> None:
+                self.on_done = None
+
+            async def start(self, **kwargs):
+                self.on_done = kwargs["on_done"]
+                return ProcessRun(
+                    run_id=kwargs["run_id"],
+                    kind=kwargs["kind"],
+                    command=kwargs["command"],
+                    log_path=kwargs["log_path"],
+                )
+
+            async def wait(self, run):
+                return run
+
+        class RecordingSync:
+            def __init__(self) -> None:
+                self.root = test_root
+                self.final_summary = ""
+                self.final_remote_path = ""
+
+            async def start_output(self, request):
+                return {"status": "completed", "file_count": 1}, ProcessRun(
+                    "output-sync", "sync", [], self.root / "jobs" / "sync.log"
+                )
+
+            async def start_output_file(self, local_file, remote_path):
+                self.final_summary = Path(local_file).read_text(encoding="utf-8")
+                self.final_remote_path = remote_path
+                return {"status": "completed", "file_count": 1}, ProcessRun(
+                    "summary-sync", "sync", [], self.root / "jobs" / "summary.log"
+                )
+
+        manager = StubManager()
+        sync = RecordingSync()
+        service = TrainingService(self.settings, manager, EventHub(), sync)
+        config = TrainingConfig(
+            path=str(self.dataset),
+            model="stabilityai/stable-diffusion-xl-base-1.0",
+            name="final_summary_demo",
+            auto_sync_output=True,
+            gdrive_output_path="sdxl_lora/outputs/final_summary_demo",
+        )
+        state, _ = asyncio.run(service.start(config))
+        completed_run = ProcessRun("training-done", "training", [], self.root / "jobs" / "done.log")
+        completed_run.status = "succeeded"
+        completed_run.returncode = 0
+        completed_run.ended_at = "2026-09-26T00:00:01+00:00"
+        asyncio.run(manager.on_done(completed_run))
+
+        self.assertIn("[OUTPUT SYNC]", sync.final_summary)
+        self.assertIn("status=completed", sync.final_summary.split("[OUTPUT SYNC]", 1)[1])
+        self.assertEqual(sync.final_remote_path, "sdxl_lora/outputs/final_summary_demo")
 
     def test_summary_samples_large_step_history_and_keeps_boundaries(self) -> None:
         steps = [

@@ -27,6 +27,7 @@ try:  # supports both `python backend/main.py` and `python -m backend.main`
     )
     from .app.paths import (
         dataset_counts,
+        list_base_models,
         validate_image_path,
         validate_local_dataset,
     )
@@ -57,7 +58,7 @@ except ImportError:  # pragma: no cover - used when the file is run directly
         TrainingConfig,
         TriggerWordUpdate,
     )
-    from app.paths import dataset_counts, validate_image_path, validate_local_dataset
+    from app.paths import dataset_counts, list_base_models, validate_image_path, validate_local_dataset
     from app.processes import ProcessManager, ProcessRun
     from app.rclone_sync import RcloneError, RcloneService
     from app.recommendations import recommend_settings
@@ -76,7 +77,7 @@ sync_service = SyncService(settings, rclone, processes, hub)
 tagger_service = TaggerService(settings, processes, hub, sync_service)
 training_service = TrainingService(settings, processes, hub, sync_service)
 
-app = FastAPI(title="SDXL LoRA Factory", version="5.1-runpod")
+app = FastAPI(title="SDXL LoRA Factory", version="5.2-runpod")
 
 
 def _http_error(error: Exception) -> HTTPException:
@@ -88,6 +89,16 @@ def _http_error(error: Exception) -> HTTPException:
 @app.on_event("startup")
 async def startup() -> None:
     settings.ensure_runtime_directories()
+    # Missing Drive credentials must not prevent the web UI from starting.
+    # When a RunPod Secret is provided, materialize it into the private config
+    # path before the first status check without ever logging its contents.
+    if settings.gdrive_enabled:
+        try:
+            rclone.ensure_config_from_environment()
+        except Exception:
+            # The detailed error is reported by /api/system/status when the user
+            # explicitly checks the Drive connection.
+            pass
     await hub.status("system", {"status": "ready", **settings.public_dict()}, "")
 
 
@@ -112,14 +123,18 @@ async def health():
 async def system_status():
     remote = None
     remote_error = None
-    try:
-        remote = await rclone.check_remote()
-    except Exception as error:
-        remote_error = {"code": getattr(error, "code", "gdrive_unavailable"), "message": str(error)}
+    if settings.gdrive_enabled:
+        try:
+            remote = await rclone.check_remote()
+        except Exception as error:
+            remote_error = {"code": getattr(error, "code", "gdrive_unavailable"), "message": str(error)}
+    else:
+        remote = {"available": False, "disabled": True}
     return {
         "settings": settings.public_dict(),
         "rclone": rclone.public_status(),
         "gdrive": {"remote": remote, "error": remote_error},
+        "models": list_base_models(settings),
         "gpu": await asyncio.to_thread(gpu_info),
         "torch": await asyncio.to_thread(torch_info),
         "dependencies": await asyncio.to_thread(dependency_info),
@@ -142,6 +157,14 @@ async def check_scripts():
         "entrypoint": str(entrypoint),
         "tagger_exists": tagger.is_file(),
     }
+
+
+@app.get("/api/base-models")
+@app.get("/api/models")
+async def base_models():
+    """List read-only SDXL checkpoints available on the attached volume."""
+
+    return await asyncio.to_thread(list_base_models, settings)
 
 
 def _dialog(kind: str) -> str:
@@ -357,7 +380,7 @@ async def recommendations(request: RecommendationRequest):
 
 @app.post("/api/cancel/{kind}")
 async def cancel(kind: str):
-    if kind not in {"training", "tagger", "sync", "setup"}:
+    if kind not in {"training", "tagger", "sync", "backup", "setup"}:
         raise HTTPException(status_code=400, detail="unsupported process kind")
     result = await processes.cancel(kind)
     if result is None:

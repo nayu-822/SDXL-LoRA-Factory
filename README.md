@@ -69,47 +69,100 @@ People who do not have a GPU (or have an AMD/Intel GPU).</code>
 
 ## RunPod / Linux Web App
 
-v5.0 adds a browser workflow for copying a dataset from Google Drive into the Pod, editing captions, training SDXL LoRA, and copying results back. The backend listens on `0.0.0.0` so it can be opened through the RunPod HTTP Proxy. Dataset and result transfers use `rclone copy`; the app never runs a destructive `rclone sync` for these workflows.
+RunPod uses the existing official PyTorch/CUDA image and clones this repository into the Pod's volatile `/app` directory. A custom Docker image is not required. The backend listens on `0.0.0.0`; expose HTTP port `8001` in the RunPod template.
 
-When a dataset is re-synced, the app first clears only the local `LOCAL_DATA_ROOT/<dataset_name>` work folder, recreates that folder, and then runs `rclone copy`. This removes files deleted from Drive while keeping the Drive side untouched. The `LOCAL_DATA_ROOT` directory itself and paths outside it are rejected by the cleanup guard.
+### RunPod template
 
-### RunPod quick start
+Recommended values:
 
-1. Start a Pod with an NVIDIA GPU and open a terminal.
-2. Clone this repository into `/workspace/SDXL-LoRA-Factory`.
-3. Install/configure `rclone` and create a Google Drive remote named `gdrive` (or set `GDRIVE_REMOTE`). Keep `rclone.conf` outside Git, for example at `/workspace/rclone/rclone.conf`.
-4. Set the environment variables below. The defaults match a standard Pod layout.
-5. Install dependencies in the Pod image, or run `AUTO_SETUP=1 ./start.sh` for the optional setup check. A manual install is:
-   `python3 -m pip install -r backend/requirements.txt && python3 -m pip install -r backend/sd-scripts/requirements.txt && python3 backend/setup_check.py`.
-   The setup check selects `onnxruntime-gpu` on Linux with an NVIDIA GPU and `onnxruntime` on Windows/CPU environments.
-6. Run `./start.sh`, then open the Pod's HTTP Proxy URL for port `8001`.
-7. Enter a Drive dataset path such as `sdxl_lora/datasets/my_character` and click **DatasetをPodへ同期**.
-8. Open the Tag Editor, run WD14, edit captions, apply batch changes/Trigger Word, and click caption sync. Existing `.txt` captions are skipped by default; choose the explicit overwrite option only when replacing manual edits is intended.
-9. Configure the base model, epochs, repeats, LoRA settings, Trigger Word, and fixed epoch sample settings. The Trigger Word is automatically added to every sample prompt for comparison, including the fallback prompt when no prompt is entered.
-10. Start training. Each epoch is saved with `--save_every_n_epochs=1`; samples use sd-scripts' `--sample_at_first` and `--sample_every_n_epochs=1` defaults.
-11. When training finishes, review the live log, Loss history, epoch LoRAs, samples, and `training_summary.txt`. Enable or manually run output sync to copy them to Drive.
-
-Example environment:
-
-```bash
-export APP_HOST=0.0.0.0
-export APP_PORT=8001
-export WORKSPACE_ROOT=/workspace
-export LOCAL_DATA_ROOT=/workspace/data
-export LOCAL_OUTPUT_ROOT=/workspace/output
-export LOCAL_JOB_ROOT=/workspace/jobs
-export RCLONE_CONFIG=/workspace/rclone/rclone.conf
-export GDRIVE_REMOTE=gdrive
-./start.sh
+```text
+Compute: NVIDIA GPU
+Image: an official RunPod PyTorch/CUDA image compatible with the selected GPU
+Volume mount path: /workspace
+HTTP port: 8001
+TCP port: 22 (optional, only when SSH is needed)
+Start command: bash -lc 'curl -fsSL https://raw.githubusercontent.com/nayu-822/SDXL-LoRA-Factory/feature/runpod-base/bootstrap.sh | bash'
 ```
 
-The same values can be copied from `.env.example` into the Pod environment. The app creates `/workspace/data`, `/workspace/output`, `/workspace/jobs`, and `/workspace/config` as needed. A training job is isolated under `/workspace/jobs/<job_id>` and `/workspace/output/<job_id>`, with `lora/`, `samples/`, `logs/`, and `training_summary.txt` inside the output directory. The summary is also written when training fails, including the error and any Loss data already collected.
+The bootstrap clones the application to `/app/SDXL-LoRA-Factory`, installs only the Factory dependencies, and starts `start.sh`. It verifies the PyTorch supplied by the base image and never installs or replaces `torch`, `torchvision`, or CUDA packages.
+
+For development, the default branch is `feature/runpod-base`:
+
+```bash
+export GIT_BRANCH=feature/runpod-base
+curl -fsSL https://raw.githubusercontent.com/nayu-822/SDXL-LoRA-Factory/feature/runpod-base/bootstrap.sh | bash
+```
+
+After merging to `main`, set `GIT_BRANCH=main`. `REPO_URL` and `APP_DIR` are also configurable.
+
+Attach the existing Network Volume at `/workspace`. Only `/workspace/models/checkpoints` is read by Factory; do not clone the repository or save Factory data on the Network Volume.
+
+### RunPod paths and environment variables
+
+```bash
+APP_HOST=0.0.0.0
+APP_PORT=8001
+WORKSPACE_ROOT=/workspace
+MODEL_DIR=/workspace/models/checkpoints
+DATA_ROOT=/data
+LOCAL_DATA_ROOT=/data/dataset
+LOCAL_OUTPUT_ROOT=/data/output
+LOCAL_JOB_ROOT=/data/jobs
+LOCAL_CONFIG_ROOT=/data/config
+CACHE_DIR=/data/cache
+RCLONE_CONFIG=/data/rclone/rclone.conf
+GDRIVE_REMOTE=gdrive
+GDRIVE_ROOT=SDXL-LoRA-Factory/runs
+GDRIVE_ENABLED=true
+```
+
+Bootstrap creates:
+
+```text
+/app/SDXL-LoRA-Factory   cloned application (volatile)
+/data/dataset            images and captions
+/data/output             epoch LoRAs, final LoRA, and samples
+/data/jobs               training.log and TensorBoard event files
+/data/config             dataset/training configs and run manifests
+/data/cache              Hugging Face and temporary caches
+/data/rclone             optional generated rclone.conf
+/workspace/models/checkpoints  shared, read-only base models
+```
+
+The UI scans only `*.safetensors` and `*.ckpt` under `MODEL_DIR`. On Linux the model dropdown is the normal selection path; model input and desktop browsing remain available for Windows compatibility. Factory rejects output and runtime paths inside `MODEL_DIR`.
+
+### Google Drive backup
+
+The **Google Drive Backup** switch is optional. When enabled, the application uses only `rclone copy` and creates an isolated run folder:
+
+```text
+gdrive:SDXL-LoRA-Factory/runs/<RUN_ID>/
+├── lora/
+├── captions/
+├── config/
+├── logs/
+└── samples/
+```
+
+Captions and reproducibility files are copied at training start. LoRAs, samples, logs, TensorBoard events, and the final `training_summary.txt` are copied at completion, failure, or cancellation. A backup error never deletes local LoRAs and is reported separately from the training result. Caption editing can also copy `.txt` files when the Tag Editor's caption sync option is enabled.
+
+Do not commit credentials to Git, `.env.example`, or the Network Volume. Provide an existing private config through `RCLONE_CONFIG`, or use `RCLONE_CONFIG_CONTENT`, `RCLONE_CONFIG_B64`, or the supported `GDRIVE_*` Secret variables. Set `GDRIVE_ENABLED=false` to use local datasets, WD14, and training without rclone.
+
+### RunPod first training
+
+1. Create a Pod from an official PyTorch/CUDA image, attach the existing Network Volume at `/workspace`, and expose HTTP `8001`.
+2. Start the bootstrap command and confirm that `/workspace/models/checkpoints` contains an SDXL `.safetensors` or `.ckpt` file.
+3. Open the HTTP Proxy URL, then sync or prepare a dataset under `/data/dataset`.
+4. Run WD14, edit captions, and enable caption sync if Drive backup is wanted.
+5. Select the model from the Base Model dropdown, configure the LoRA settings, and enable Google Drive Backup if required.
+6. Start training. Confirm loss in the UI and `training.log`, `loss_history.json`, and TensorBoard files under `/data/jobs/<RUN_ID>`.
+7. Verify `/data/output/<RUN_ID>` and `gdrive:SDXL-LoRA-Factory/runs/<RUN_ID>/` after completion.
 
 ### RunPod troubleshooting
 
-The system status card reports missing `rclone`, a missing `rclone.conf`, a missing Drive remote, and GPU/PyTorch information. Dataset, model, WD14, sample, training, and output-sync errors are shown in the UI and retained in the job log/summary where possible. WD14 logs the available ONNX Runtime providers and the provider selected for the session; it prefers CUDA on Linux/NVIDIA and falls back to CPU when CUDA is unavailable. On Linux the desktop Browse dialogs are intentionally disabled; enter Pod paths manually. `WD14_ALLOW_MOCK=true` is available only for a local smoke test and should not be used for real captions.
+The system status card reports GPU/PyTorch, rclone, Drive, and model-directory state. If the model directory is missing or empty, the UI displays an explicit Network Volume error. `WD14_ALLOW_MOCK=true` is for local smoke tests only and must not be used for real captions.
 
-The final `training_summary.txt` records the actual Trigger Word, loss diagnostics, and an `[OUTPUT SYNC]` section. Automatic output-sync failure is a warning and does not change a successfully completed training job to `failed`. On RunPod/Linux, dataset editing, WD14, caption sync, and dataset cleanup are limited to `LOCAL_DATA_ROOT`; the Windows desktop compatibility switch can continue to accept external dataset folders.
+The original Windows `start.bat` workflow, Windows-specific paths, and legacy `LOCAL_*` environment variables are retained. Windows continues to use its local `.runtime` directories and can keep the existing external dataset compatibility switch.
 
 The original Windows `start.bat` workflow and Windows-oriented usage notes below are retained.
 

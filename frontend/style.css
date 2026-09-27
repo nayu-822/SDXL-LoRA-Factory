@@ -247,7 +247,7 @@ code {
     flex-wrap: wrap;
 }
 
-.input-with-button input, .batch-row input { flex: 1; min-width: 12rem; }
+.input-with-button input, .input-with-button select, .batch-row input { flex: 1; min-width: 12rem; }
 .btn-secondary { background: rgba(255, 255, 255, 0.08); color: white; border: 1px solid var(--glass-border); }
 .btn-danger { background: rgba(239, 68, 68, 0.13); color: #fca5a5; border: 1px solid #ef4444; }
 .btn-success { background: rgba(52, 211, 153, 0.13); color: #6ee7b7; border: 1px solid #34d399; }
